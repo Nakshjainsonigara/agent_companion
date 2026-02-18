@@ -1,0 +1,49 @@
+{
+  "name": "agent-companion-pwa",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Premium dark PWA for monitoring Codex and Claude Code sessions.",
+  "scripts": {
+    "dev": "vite",
+    "stack:start": "node scripts/dev-stack.mjs",
+    "bridge": "node bridge/server.mjs",
+    "relay": "node relay/server.mjs",
+    "laptop:companion": "node scripts/laptop-companion.mjs",
+    "laptop:service": "node scripts/laptop-service.mjs",
+    "run:agent": "node scripts/agent-runner.mjs",
+    "resume:repair": "node scripts/repair-codex-resume.mjs",
+    "task:start": "node scripts/start-task.mjs",
+    "pending:add": "node scripts/add-pending.mjs",
+    "bridge:reset": "node scripts/reset-bridge.mjs",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@radix-ui/react-switch": "^1.2.6",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "lucide-react": "^0.564.0",
+    "qrcode-terminal": "^0.12.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4",
+    "tailwind-merge": "^3.4.1",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.2.3",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vite-pwa/assets-generator": "^1.0.2",
+    "@vitejs/plugin-react": "^5.1.0",
+    "autoprefixer": "^10.4.24",
+    "postcss": "^8.5.6",
+    "tailwindcss": "^3.4.17",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1",
+    "vite-plugin-pwa": "^1.2.0"
+  }
+}

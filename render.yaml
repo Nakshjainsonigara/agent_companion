@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: agent-companion-relay
+    runtime: node
+    plan: free
+    region: oregon
+    buildCommand: npm ci
+    startCommand: npm run relay
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: RELAY_PUBLIC_URL
+        sync: false

@@ -1,0 +1,83 @@
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    color-scheme: dark;
+
+    --background: 240 10% 4.5%;
+    --foreground: 240 6% 93%;
+
+    --surface: 240 6% 9%;
+    --surface-hover: 240 5% 12%;
+
+    --muted: 240 5% 14%;
+    --muted-foreground: 240 4% 49%;
+
+    --border: 240 5% 12%;
+    --input: 240 5% 14%;
+    --ring: 24 55% 58%;
+
+    --destructive: 0 72% 63%;
+    --destructive-foreground: 0 0% 98%;
+
+    --brand-claude: 24 55% 58%;
+    --brand-claude-dim: 24 40% 20%;
+    --brand-claude-foreground: 24 70% 90%;
+
+    --brand-openai: 163 40% 58%;
+    --brand-openai-dim: 163 30% 18%;
+    --brand-openai-foreground: 163 50% 88%;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    min-height: 100%;
+  }
+
+  body {
+    margin: 0;
+    @apply bg-background font-sans text-foreground antialiased;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    margin: 0;
+    @apply font-space tracking-tight;
+  }
+
+  p {
+    margin: 0;
+  }
+
+  button, input, textarea {
+    font: inherit;
+  }
+
+  *::-webkit-scrollbar {
+    width: 4px;
+    height: 4px;
+  }
+
+  *::-webkit-scrollbar-thumb {
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  *::-webkit-scrollbar-track {
+    background: transparent;
+  }
+}
+
+@layer utilities {
+  .divider {
+    @apply border-b border-white/[0.06];
+  }
+}

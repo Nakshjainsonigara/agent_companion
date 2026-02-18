@@ -1,0 +1,117 @@
+export type AgentType = "CODEX" | "CLAUDE";
+export type BridgeMode = "LOCAL" | "REMOTE";
+
+export type SessionState =
+  | "RUNNING"
+  | "WAITING_INPUT"
+  | "COMPLETED"
+  | "FAILED"
+  | "CANCELLED";
+
+export type ActionType = "APPROVE" | "REJECT" | "TEXT_REPLY";
+
+export interface TokenUsage {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  costUsd: number;
+}
+
+export interface AgentSession {
+  id: string;
+  agentType: AgentType;
+  title: string;
+  repo: string;
+  branch: string;
+  state: SessionState;
+  lastUpdated: number;
+  progress: number;
+  tokenUsage: TokenUsage;
+}
+
+export interface SessionEvent {
+  id: string;
+  sessionId: string;
+  summary: string;
+  timestamp: number;
+  category: "INFO" | "ACTION" | "INPUT" | "ERROR";
+}
+
+export interface PendingInput {
+  id: string;
+  sessionId: string;
+  prompt: string;
+  requestedAt: number;
+  priority: "HIGH" | "MEDIUM" | "LOW";
+  actionable?: boolean;
+  source?: "BRIDGE" | "DIRECT" | string;
+  meta?: Record<string, unknown> | null;
+}
+
+export interface UserAction {
+  pendingInputId: string;
+  sessionId: string;
+  type: ActionType;
+  text?: string;
+}
+
+export interface SettingsPrefs {
+  criticalRealtime: boolean;
+  digest: boolean;
+  pairingHealthy: boolean;
+  metadataOnly: boolean;
+  darkLocked: boolean;
+  networkOnline: boolean;
+}
+
+export interface Workspace {
+  path: string;
+  name: string;
+  hasGit: boolean;
+  score: number;
+  lastModified: number;
+}
+
+export interface PairingConfig {
+  mode: BridgeMode;
+  relayBaseUrl: string;
+  phoneToken: string;
+  deviceId: string | null;
+  phoneLabel: string | null;
+  pairedAt: number;
+}
+
+export interface RemoteDeviceStatus {
+  online: boolean;
+  deviceId: string | null;
+  deviceLabel: string | null;
+  lastSeenAt: number | null;
+}
+
+export type LauncherRunStatus = "STARTING" | "RUNNING" | "COMPLETED" | "FAILED" | "STOPPED";
+
+export interface LauncherRun {
+  id: string;
+  sessionId: string;
+  agentType: AgentType;
+  title: string;
+  prompt: string;
+  workspacePath: string;
+  repo: string;
+  branch: string;
+  status: LauncherRunStatus;
+  createdAt: number;
+  startedAt: number | null;
+  endedAt: number | null;
+  pid: number | null;
+  exitCode: number | null;
+  signal?: string | null;
+  error: string | null;
+  codexThreadId?: string | null;
+  resumeCommand?: string | null;
+  stopRequested: boolean;
+  fullWorkspaceAccess?: boolean;
+  skipPermissions?: boolean;
+  planMode?: boolean;
+  outputTail: string[];
+}

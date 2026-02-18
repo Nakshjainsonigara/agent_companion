@@ -1,0 +1,213 @@
+#!/usr/bin/env node
+import { spawn } from "node:child_process";
+import process from "node:process";
+import { printAgentCompanionBanner, printInfoLine } from "./banner.mjs";
+
+const argv = process.argv.slice(2);
+const args = parseArgs(argv);
+
+const bridgePort = clampInt(args["bridge-port"], 8787, 1, 65535);
+const relayPort = clampInt(args["relay-port"], 9797, 1, 65535);
+const withLocalRelay = toBool(args["with-local-relay"]);
+const relayUrl = trim(args.relay) || trim(process.env.AGENT_RELAY_URL) || (withLocalRelay ? `http://localhost:${relayPort}` : "");
+const companionName = trim(args.name);
+const companionStateFile = trim(args["state-file"]);
+const bridgeToken = trim(args["bridge-token"]) || trim(process.env.AGENT_BRIDGE_TOKEN);
+
+if (!relayUrl) {
+  printUsageAndExit(1, "relay URL is required unless --with-local-relay is provided.");
+}
+
+const bridgeBaseUrl = `http://localhost:${bridgePort}`;
+const childSpecs = [];
+
+printAgentCompanionBanner();
+
+childSpecs.push({
+  name: "bridge",
+  cmd: process.execPath,
+  args: ["bridge/server.mjs"],
+  env: {
+    ...process.env,
+    AGENT_BRIDGE_PORT: String(bridgePort),
+    ...(bridgeToken ? { AGENT_BRIDGE_TOKEN: bridgeToken } : {})
+  }
+});
+
+if (withLocalRelay) {
+  childSpecs.push({
+    name: "relay",
+    cmd: process.execPath,
+    args: ["relay/server.mjs"],
+    env: {
+      ...process.env,
+      RELAY_PORT: String(relayPort),
+      RELAY_PUBLIC_URL: trim(args["relay-public-url"]) || process.env.RELAY_PUBLIC_URL || `http://localhost:${relayPort}`
+    }
+  });
+}
+
+const children = [];
+let shuttingDown = false;
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+
+for (const spec of childSpecs) {
+  const child = spawn(spec.cmd, spec.args, {
+    cwd: process.cwd(),
+    env: spec.env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  attachLogs(spec.name, child);
+  children.push({ name: spec.name, child });
+}
+
+await waitForHealth(`${bridgeBaseUrl}/health`, 15_000, "bridge");
+if (withLocalRelay) {
+  await waitForHealth(`${relayUrl}/health`, 15_000, "relay");
+}
+
+printInfoLine("bridge", bridgeBaseUrl);
+printInfoLine("relay", relayUrl);
+console.log("");
+
+const companionArgs = [
+  "scripts/laptop-companion.mjs",
+  "--bridge",
+  bridgeBaseUrl,
+  "--relay",
+  relayUrl
+];
+
+if (companionName) {
+  companionArgs.push("--name", companionName);
+}
+if (companionStateFile) {
+  companionArgs.push("--state-file", companionStateFile);
+}
+if (bridgeToken) {
+  companionArgs.push("--bridgeToken", bridgeToken);
+}
+
+const companion = spawn(process.execPath, companionArgs, {
+  cwd: process.cwd(),
+  env: process.env,
+  stdio: ["ignore", "pipe", "pipe"]
+});
+companion.stdout.pipe(process.stdout);
+companion.stderr.pipe(process.stderr);
+children.push({ name: "companion", child: companion });
+
+companion.on("close", (code) => {
+  if (shuttingDown) return;
+  if (Number.isInteger(code) && code === 0) return;
+  console.error(`[laptop-service] companion exited with code ${code ?? "unknown"}`);
+  shutdown("companion-exit");
+});
+
+function attachLogs(name, child) {
+  child.stdout.on("data", (chunk) => {
+    process.stdout.write(`[${name}] ${chunk}`);
+  });
+  child.stderr.on("data", (chunk) => {
+    process.stderr.write(`[${name}] ${chunk}`);
+  });
+  child.on("close", (code) => {
+    if (shuttingDown) return;
+    if (Number.isInteger(code) && code === 0) return;
+    console.error(`[laptop-service] ${name} exited with code ${code ?? "unknown"}`);
+  });
+}
+
+function shutdown(reason) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  process.stderr.write(`\n[laptop-service] shutting down (${reason})...\n`);
+
+  for (const { child } of children) {
+    if (!child.killed) {
+      child.kill("SIGTERM");
+    }
+  }
+
+  setTimeout(() => {
+    for (const { child } of children) {
+      if (!child.killed) {
+        child.kill("SIGKILL");
+      }
+    }
+    process.exit(0);
+  }, 1500);
+}
+
+async function waitForHealth(url, timeoutMs, name) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    try {
+      const response = await fetch(url, { method: "GET" });
+      if (response.ok) return;
+    } catch {
+      // keep retrying
+    }
+    await sleep(250);
+  }
+  throw new Error(`${name} health check timed out at ${url}`);
+}
+
+function parseArgs(tokens) {
+  const out = {};
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index];
+    if (!token.startsWith("--")) continue;
+    const key = token.slice(2);
+    const next = tokens[index + 1];
+    if (!next || next.startsWith("--")) {
+      out[key] = "true";
+      continue;
+    }
+    out[key] = next;
+    index += 1;
+  }
+  return out;
+}
+
+function toBool(value) {
+  const normalized = trim(value).toLowerCase();
+  return normalized === "1" || normalized === "true" || normalized === "yes" || normalized === "on";
+}
+
+function trim(value) {
+  return String(value || "").trim();
+}
+
+function clampInt(value, fallback, min, max) {
+  const parsed = Number.parseInt(String(value || ""), 10);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.max(min, Math.min(max, parsed));
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function printUsageAndExit(code, error = "") {
+  if (error) {
+    console.error(`[laptop-service] ${error}`);
+  }
+  console.log(`Usage:
+  node scripts/laptop-service.mjs --relay <url> [options]
+  node scripts/laptop-service.mjs --with-local-relay [options]
+
+Options:
+  --relay <url>                 Public or private relay URL for companion
+  --with-local-relay            Also run relay in this process group
+  --relay-port <port>           Relay port when --with-local-relay (default: 9797)
+  --relay-public-url <url>      Public URL relay announces (default local URL)
+  --bridge-port <port>          Bridge port (default: 8787)
+  --bridge-token <token>        Optional bridge token
+  --name <label>                Laptop display name for pairing
+  --state-file <path>           Companion state file path
+`);
+  process.exit(code);
+}
