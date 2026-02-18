@@ -3,6 +3,7 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
+import { printAgentCompanionBanner } from "./banner.mjs";
 
 const argv = process.argv.slice(2);
 const args = parseArgs(argv);
@@ -25,8 +26,7 @@ const verbose = toBool(args.verbose) || toBool(process.env.AGENT_VERBOSE);
 const bridgeBaseUrl = `http://localhost:${bridgePort}`;
 const childSpecs = [];
 
-console.log("Starting Agent Companion laptop service...");
-console.log("");
+printAgentCompanionBanner();
 
 childSpecs.push({
   name: "bridge",

@@ -3,15 +3,14 @@
 export function printAgentCompanionBanner() {
   const useColor = shouldUseColor();
   const reset = useColor ? "\x1b[0m" : "";
-  const accent = colorRgb(207, 136, 89, useColor, true);
-  const dot = colorRgb(105, 191, 166, useColor, true);
-  const muted = colorRgb(121, 123, 130, useColor, true);
-  const dim = colorRgb(121, 123, 130, useColor);
+  const brand = colorRgb(209, 145, 99, useColor, true);
+  const dot = colorRgb(34, 182, 155, useColor, true);
+  const text = colorRgb(181, 187, 200, useColor, true);
+  const hint = colorRgb(121, 123, 130, useColor);
 
   console.log("");
-  console.log(`  ${accent}▄▀▄${reset} ${dot}·${reset} ${muted}█▀▀${reset}`);
-  console.log(`  ${accent}█▀█${reset}   ${muted}█${reset}    ${dim}agent${reset}${dot}.${reset}${dim}companion${reset}`);
-  console.log(`  ${accent}▀ ▀${reset}   ${muted}▀▀▀${reset}`);
+  console.log(`  ${brand}agent${reset}${text}.${reset}${text}companion${reset} ${dot}•${reset}`);
+  console.log(`  ${hint}laptop service${reset}`);
   console.log("");
 }
 
