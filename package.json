@@ -19,6 +19,9 @@
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },
+  "bin": {
+    "agent-companion": "scripts/cli.mjs"
+  },
   "dependencies": {
     "@radix-ui/react-switch": "^1.2.6",
     "class-variance-authority": "^0.7.1",

@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 import { spawn } from "node:child_process";
+import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { printAgentCompanionBanner, printInfoLine } from "./banner.mjs";
 
 const argv = process.argv.slice(2);
 const args = parseArgs(argv);
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, "..");
 
 const bridgePort = clampInt(args["bridge-port"], 8787, 1, 65535);
 const relayPort = clampInt(args["relay-port"], 9797, 1, 65535);
@@ -55,7 +60,7 @@ process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 for (const spec of childSpecs) {
   const child = spawn(spec.cmd, spec.args, {
-    cwd: process.cwd(),
+    cwd: projectRoot,
     env: spec.env,
     stdio: ["ignore", "pipe", "pipe"]
   });
@@ -91,7 +96,7 @@ if (bridgeToken) {
 }
 
 const companion = spawn(process.execPath, companionArgs, {
-  cwd: process.cwd(),
+  cwd: projectRoot,
   env: process.env,
   stdio: ["ignore", "pipe", "pipe"]
 });
