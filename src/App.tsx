@@ -5,7 +5,6 @@ import {
   ChevronDown,
   ChevronRight,
   Clock3,
-  Copy,
   Folder,
   FolderGit2,
   LayoutDashboard,
@@ -37,7 +36,6 @@ import {
   fetchWorkspaces,
   launchTask,
   loadPairingConfig,
-  pingBridge,
   savePairingConfig,
   stopRun,
   submitBridgeAction,
@@ -112,6 +110,7 @@ const TAB_ITEMS: Array<{
 ];
 
 const FILTER_ITEMS: Filter[] = ["ALL", "WAITING_INPUT", "RUNNING", "FAILED", "COMPLETED"];
+const FIXED_RELAY_URL = ((import.meta.env.VITE_RELAY_URL as string | undefined) || "https://agent-companion-relay.onrender.com").trim();
 
 function App() {
   const [activeTab, setActiveTab] = useState<Tab>("DASHBOARD");
@@ -134,13 +133,17 @@ function App() {
   const [bridgeConnected, setBridgeConnected] = useState(false);
 
   // ── Pairing state ──
-  const [pairingConfig, setPairingConfig] = useState<PairingConfig | null>(() => loadPairingConfig());
+  const [pairingConfig, setPairingConfig] = useState<PairingConfig | null>(() => {
+    const stored = loadPairingConfig();
+    if (stored?.mode !== "REMOTE") return null;
+    if (isLocalRelayUrl(stored.relayBaseUrl)) return null;
+    return stored;
+  });
   const [deviceStatus, setDeviceStatus] = useState<RemoteDeviceStatus | null>(null);
   const [isPairing, setIsPairing] = useState(false);
-  const [pairRelayUrl, setPairRelayUrl] = useState("http://localhost:9797");
   const [pairCode, setPairCode] = useState("");
   const [pairError, setPairError] = useState<string | null>(null);
-  const [settingsRelayUrl, setSettingsRelayUrl] = useState("");
+  const pairRelayUrl = FIXED_RELAY_URL;
 
   // ── Derived client config ──
   const clientConfig = useMemo<ClientConfig>(() => {
@@ -292,11 +295,6 @@ function App() {
     const iv = setInterval(() => { void poll(); }, 10_000);
     return () => { cancelled = true; clearInterval(iv); };
   }, [pairingConfig, clientConfig]);
-
-  // ── Settings relay URL sync ──
-  useEffect(() => {
-    setSettingsRelayUrl(pairingConfig?.relayBaseUrl ?? "http://localhost:9797");
-  }, [pairingConfig?.relayBaseUrl]);
 
   // ── Toast auto-dismiss ──
   useEffect(() => {
@@ -631,19 +629,6 @@ function App() {
     })();
   };
 
-  const handleSkipToLocal = () => {
-    const config: PairingConfig = {
-      mode: "LOCAL",
-      relayBaseUrl: "",
-      phoneToken: "",
-      deviceId: null,
-      phoneLabel: null,
-      pairedAt: Date.now(),
-    };
-    savePairingConfig(config);
-    setPairingConfig(config);
-  };
-
   const handleUnpair = () => {
     clearPairingConfig();
     setPairingConfig(null);
@@ -659,13 +644,11 @@ function App() {
     return (
       <PairingScreen
         relayUrl={pairRelayUrl}
-        onRelayUrlChange={setPairRelayUrl}
         code={pairCode}
         onCodeChange={setPairCode}
         error={pairError}
         isPairing={isPairing}
         onPair={handlePair}
-        onSkipToLocal={handleSkipToLocal}
       />
     );
   }
@@ -1450,168 +1433,22 @@ function App() {
             <h2 className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Settings</h2>
 
             <div className="mt-4 space-y-0">
-              {/* Mode */}
-              <div className="flex items-center justify-between py-3">
-                <span className="text-[13px]">Mode</span>
-                <Badge variant={isRemote ? "success" : "muted"}>
-                  {isRemote ? "Remote" : "Local"}
-                </Badge>
-              </div>
-
-              <div className="divider" />
-
-              {/* Switch mode */}
-              <div className="flex items-center justify-between py-3">
-                <span className="text-[13px]">Remote mode</span>
-                <Switch
-                  checked={isRemote}
-                  onCheckedChange={(checked) => {
-                    if (!pairingConfig) return;
-                    const updated: PairingConfig = { ...pairingConfig, mode: checked ? "REMOTE" : "LOCAL" };
-                    savePairingConfig(updated);
-                    setPairingConfig(updated);
-                  }}
-                />
-              </div>
-
-              <div className="divider" />
-
-              {/* Relay URL editor (REMOTE only) */}
-              {isRemote && (
-                <>
-                  <div className="py-3">
-                    <label className="text-[13px]">Relay URL</label>
-                    <div className="mt-1.5 flex gap-2">
-                      <Input
-                        value={settingsRelayUrl}
-                        onChange={(e) => setSettingsRelayUrl(e.target.value)}
-                        className="font-mono text-[12px]"
-                      />
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => {
-                          if (!pairingConfig) return;
-                          const updated: PairingConfig = { ...pairingConfig, relayBaseUrl: settingsRelayUrl.trim() };
-                          savePairingConfig(updated);
-                          setPairingConfig(updated);
-                          setToast("Relay URL saved");
-                        }}
-                      >
-                        Save
-                      </Button>
-                    </div>
-                  </div>
-                  <div className="divider" />
-                </>
-              )}
-
-              {/* Test connection */}
-              <div className="flex items-center justify-between py-3">
-                <span className="text-[13px]">Connection</span>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => {
-                    void (async () => {
-                      const ok = await pingBridge(clientConfig);
-                      setToast(ok ? "Connection OK" : "Connection failed");
-                    })();
-                  }}
-                >
-                  Test
-                </Button>
-              </div>
-
-              <div className="divider" />
-
-              {/* Device status (REMOTE only) */}
-              {isRemote && (
-                <>
-                  <div className="flex items-center justify-between py-3">
-                    <span className="text-[13px]">Device status</span>
-                    <Badge variant={deviceStatus?.online ? "success" : "danger"}>
-                      {deviceStatus?.online ? "Online" : "Offline"}
-                    </Badge>
-                  </div>
-                  <div className="divider" />
-                </>
-              )}
-
-              {/* Connection */}
               <div className="flex items-center justify-between py-3">
                 <div className="flex items-center gap-2.5">
-                  <span className={cn("h-2 w-2 rounded-full", settings.pairingHealthy ? "bg-emerald-400" : "bg-rose-400")} />
-                  <span className="text-[13px]">Pairing</span>
+                  <span className={cn("h-2 w-2 rounded-full", deviceStatus?.online ? "bg-emerald-400" : "bg-rose-400")} />
+                  <span className="text-[13px]">Laptop status</span>
                 </div>
-                <Badge variant={settings.pairingHealthy ? "success" : "danger"}>
-                  {settings.pairingHealthy ? "OK" : "Down"}
+                <Badge variant={deviceStatus?.online ? "success" : "danger"}>
+                  {deviceStatus?.online ? "Online" : "Offline"}
                 </Badge>
               </div>
 
               <div className="divider" />
-              <SettingRow label="Bridge" checked={bridgeEnabled} onCheckedChange={setBridgeEnabled} />
-              <div className="divider" />
-              <SettingRow
-                label="Alerts"
-                checked={settings.criticalRealtime}
-                onCheckedChange={(value) => setSettings((prev) => ({ ...prev, criticalRealtime: value }))}
-              />
-              <div className="divider" />
-              <SettingRow
-                label="Digest"
-                checked={settings.digest}
-                onCheckedChange={(value) => setSettings((prev) => ({ ...prev, digest: value }))}
-              />
-              <div className="divider" />
-              <SettingRow
-                label="Offline mode"
-                checked={!settings.networkOnline}
-                disabled={bridgeEnabled}
-                onCheckedChange={(value) => setSettings((prev) => ({ ...prev, networkOnline: !value }))}
-              />
-              <div className="divider" />
-              <SettingRow
-                label="Metadata only"
-                checked={settings.metadataOnly}
-                onCheckedChange={(value) => setSettings((prev) => ({ ...prev, metadataOnly: value }))}
-              />
-              <div className="divider" />
-              <div className="flex items-center justify-between py-3">
-                <span className="text-[13px] text-muted-foreground">Theme</span>
-                <Badge variant="muted">Dark</Badge>
-              </div>
-
-              {/* Debug section */}
-              <div className="divider" />
               <div className="py-3">
-                <h3 className="text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground">Debug</h3>
-                <pre className="mt-2 rounded-lg bg-black/30 p-2.5 font-mono text-[10px] leading-relaxed text-muted-foreground/60">
-{`mode: ${pairingConfig.mode}
-deviceId: ${pairingConfig.deviceId ?? "—"}
-relay: ${pairingConfig.relayBaseUrl || "—"}
-paired: ${pairingConfig.pairedAt ? new Date(pairingConfig.pairedAt).toLocaleString() : "—"}`}
-                </pre>
-                <Button
-                  size="sm"
-                  variant="ghost"
-                  className="mt-2 w-full gap-1.5 text-muted-foreground/50"
-                  onClick={() => {
-                    const info = {
-                      mode: pairingConfig.mode,
-                      deviceId: pairingConfig.deviceId,
-                      relayBaseUrl: pairingConfig.relayBaseUrl,
-                      pairedAt: pairingConfig.pairedAt,
-                      deviceOnline: deviceStatus?.online ?? null,
-                      bridgeConnected,
-                    };
-                    void navigator.clipboard.writeText(JSON.stringify(info, null, 2));
-                    setToast("Debug info copied");
-                  }}
-                >
-                  <Copy className="h-3 w-3" />
-                  Copy debug info
-                </Button>
+                <p className="text-[11px] text-muted-foreground/65">
+                  Connected relay
+                </p>
+                <p className="mt-1 font-mono text-[11px] text-foreground/80">{pairingConfig.relayBaseUrl || pairRelayUrl}</p>
               </div>
 
               {/* Unpair */}
@@ -1715,25 +1552,6 @@ function StatTile({
   );
 }
 
-function SettingRow({
-  label,
-  checked,
-  onCheckedChange,
-  disabled
-}: {
-  label: string;
-  checked: boolean;
-  onCheckedChange: (checked: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <div className="flex items-center justify-between py-3">
-      <span className="text-[13px]">{label}</span>
-      <Switch checked={checked} onCheckedChange={onCheckedChange} disabled={disabled} />
-    </div>
-  );
-}
-
 function EmptyState({ message }: { message: string }) {
   return (
     <div className="py-12 text-center">
@@ -1830,6 +1648,18 @@ function priorityWeight(priority: PendingInput["priority"]) {
   return 2;
 }
 
+function isLocalRelayUrl(value: string | null | undefined) {
+  const raw = String(value || "").trim();
+  if (!raw) return false;
+  try {
+    const parsed = new URL(raw);
+    const host = parsed.hostname.toLowerCase();
+    return host === "localhost" || host === "127.0.0.1" || host === "::1";
+  } catch {
+    return false;
+  }
+}
+
 function extractFinalModelOutput(outputTail: string[]) {
   if (!Array.isArray(outputTail) || outputTail.length === 0) return "";
 
@@ -1902,22 +1732,18 @@ function cleanOutputText(text: string) {
 
 function PairingScreen({
   relayUrl,
-  onRelayUrlChange,
   code,
   onCodeChange,
   error,
   isPairing,
   onPair,
-  onSkipToLocal,
 }: {
   relayUrl: string;
-  onRelayUrlChange: (v: string) => void;
   code: string;
   onCodeChange: (v: string) => void;
   error: string | null;
   isPairing: boolean;
   onPair: () => void;
-  onSkipToLocal: () => void;
 }) {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-6">
@@ -1936,15 +1762,9 @@ function PairingScreen({
 
         {/* Form */}
         <div className="mt-8 space-y-4">
-          <div>
-            <label className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/50">Relay URL</label>
-            <Input
-              value={relayUrl}
-              onChange={(e) => onRelayUrlChange(e.target.value)}
-              className="mt-1.5 font-mono text-[12px]"
-              placeholder="http://localhost:9797"
-            />
-          </div>
+          <p className="rounded-xl border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-center text-[11px] text-muted-foreground/70">
+            Relay: <span className="font-mono text-[10px] text-foreground/80">{relayUrl}</span>
+          </p>
 
           <div>
             <label className="text-[11px] font-medium uppercase tracking-wider text-muted-foreground/50">Pairing Code</label>
@@ -1977,16 +1797,6 @@ function PairingScreen({
             )}
             Pair
           </Button>
-        </div>
-
-        {/* Skip link */}
-        <div className="mt-6 text-center">
-          <button
-            onClick={onSkipToLocal}
-            className="text-[12px] text-muted-foreground/40 transition hover:text-foreground"
-          >
-            Use local bridge instead
-          </button>
         </div>
       </div>
     </div>

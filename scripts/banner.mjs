@@ -3,39 +3,22 @@
 export function printAgentCompanionBanner() {
   const useColor = shouldUseColor();
   const reset = useColor ? "\x1b[0m" : "";
-  const accent = colorRgb(210, 145, 99, useColor, true);
-  const dot = colorRgb(45, 197, 155, useColor, true);
-  const muted = colorRgb(148, 154, 167, useColor, true);
-
-  const barLen = 31;
-  let bar = "";
-  for (let i = 0; i < barLen; i++) {
-    const t = i / (barLen - 1);
-    let r, g, b;
-    if (t < 0.5) {
-      const s = t * 2;
-      r = lerp(210, 45, s);
-      g = lerp(145, 197, s);
-      b = lerp(99, 155, s);
-    } else {
-      const s = (t - 0.5) * 2;
-      r = lerp(45, 148, s);
-      g = lerp(197, 154, s);
-      b = lerp(155, 167, s);
-    }
-    bar += `${colorRgb(r, g, b, useColor)}━${reset}`;
-  }
+  const accent = colorRgb(207, 136, 89, useColor, true);
+  const dot = colorRgb(105, 191, 166, useColor, true);
+  const muted = colorRgb(121, 123, 130, useColor, true);
+  const dim = colorRgb(121, 123, 130, useColor);
 
   console.log("");
-  console.log(`  ${accent}a g e n t${reset}  ${dot}·${reset}  ${muted}c o m p a n i o n${reset}`);
-  console.log(`  ${bar}`);
+  console.log(`  ${accent}▄▀▄${reset} ${dot}·${reset} ${muted}█▀▀${reset}`);
+  console.log(`  ${accent}█▀█${reset}   ${muted}█${reset}    ${dim}agent${reset}${dot}.${reset}${dim}companion${reset}`);
+  console.log(`  ${accent}▀ ▀${reset}   ${muted}▀▀▀${reset}`);
   console.log("");
 }
 
 export function printInfoLine(label, value) {
   const useColor = shouldUseColor();
-  const labelColor = colorRgb(120, 128, 143, useColor);
-  const valueColor = colorRgb(210, 215, 224, useColor, true);
+  const labelColor = colorRgb(121, 123, 130, useColor);
+  const valueColor = colorRgb(236, 236, 239, useColor, true);
   const reset = useColor ? "\x1b[0m" : "";
 
   console.log(`  ${labelColor}${label.padEnd(10)}${reset}${valueColor}${value}${reset}`);
@@ -45,10 +28,6 @@ function shouldUseColor() {
   if (process.env.NO_COLOR) return false;
   if (process.env.FORCE_COLOR === "0") return false;
   return process.stdout.isTTY;
-}
-
-function lerp(a, b, t) {
-  return Math.round(a + (b - a) * t);
 }
 
 function colorRgb(r, g, b, enabled, bold = false) {

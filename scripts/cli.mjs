@@ -45,12 +45,14 @@ function runNodeScript(scriptPath, args) {
 
 function printHelp(exitCode) {
   console.log(`Usage:
+  agent-companion laptop
   agent-companion laptop --relay <url>
   agent-companion laptop --with-local-relay
   agent-companion relay
   agent-companion bridge
 
 Examples:
+  agent-companion laptop
   agent-companion laptop --relay https://agent-companion-relay.onrender.com
   agent-companion laptop --with-local-relay
 `);

@@ -10,7 +10,7 @@ Premium dark **web/PWA** for monitoring Codex + Claude Code sessions from phone.
 - Bridge mode for real laptop sessions.
 - Direct monitoring of local Codex and Claude Code history files (no wrapper required).
 - Phone-triggered local task launcher (no GitHub required).
-- Relay + QR pairing flow for phone-to-laptop remote control.
+- Relay pairing flow for phone-to-laptop remote control.
 
 ## 0) Full remote pairing flow (phone + laptop)
 This is the end-to-end path when users are not on the same local network.
@@ -30,7 +30,7 @@ npm run laptop:companion -- --relay http://localhost:9797 --bridge http://localh
 
 What happens:
 - Companion registers laptop with relay.
-- Companion prints a short pair code + QR.
+- Companion prints a short pair code.
 - Phone app claims pair code via relay.
 - Relay stores phone token and proxies requests to connected laptop bridge.
 
@@ -54,6 +54,13 @@ Run bridge + companion together from one command:
 
 ```bash
 cd /Users/nakshjain/Desktop/agent
+npm run laptop:service
+```
+
+Override relay URL when needed:
+
+```bash
+cd /Users/nakshjain/Desktop/agent
 npm run laptop:service -- --relay https://<your-public-relay-url>
 ```
 
@@ -66,8 +73,9 @@ npm run laptop:service -- --with-local-relay
 
 Notes:
 - `--with-local-relay` is for local/dev only unless you expose relay publicly.
-- For internet pairing, pass a public relay URL via `--relay`.
-- The companion still prints pair code + QR in both modes.
+- Default public relay is `https://agent-companion-relay.onrender.com`.
+- Override relay via `--relay` only when needed.
+- Companion prints pair code only (no QR).
 
 ## 0.6) Deploy relay on Render (free)
 This repo now includes a Render blueprint at `render.yaml`.
@@ -84,7 +92,7 @@ cd /Users/nakshjain/Desktop/agent
 npm run laptop:service -- --relay https://<your-render-relay>.onrender.com
 ```
 
-In the phone app pairing screen, use the same relay URL.
+In the phone app pairing screen, enter only the pair code.
 
 Note: Render free tier can sleep when idle; first request/pair may take a short warm-up.
 

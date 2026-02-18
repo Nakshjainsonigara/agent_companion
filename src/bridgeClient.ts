@@ -29,7 +29,7 @@ export interface ClientConfig {
 }
 
 const DEFAULT_BRIDGE_URL = "http://localhost:8787";
-const DEFAULT_RELAY_URL = "http://localhost:9797";
+const DEFAULT_RELAY_URL = defaultRelayUrlFromEnv();
 const PAIRING_STORAGE_KEY = "agent_companion_pairing_v1";
 
 let bridgeToken: string | null = null;
@@ -430,6 +430,13 @@ function bridgeBaseUrlFromEnv() {
   if (inferred) return inferred;
 
   return DEFAULT_BRIDGE_URL;
+}
+
+function defaultRelayUrlFromEnv() {
+  const fromEnv = import.meta.env.VITE_RELAY_URL as string | undefined;
+  const normalizedEnv = normalizeBaseUrl(fromEnv, "");
+  if (normalizedEnv) return normalizedEnv;
+  return "https://agent-companion-relay.onrender.com";
 }
 
 function normalizeBaseUrl(value: string | undefined | null, fallback: string) {

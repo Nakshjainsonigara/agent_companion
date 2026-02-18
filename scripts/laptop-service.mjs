@@ -3,7 +3,6 @@ import { spawn } from "node:child_process";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { printAgentCompanionBanner, printInfoLine } from "./banner.mjs";
 
 const argv = process.argv.slice(2);
 const args = parseArgs(argv);
@@ -14,19 +13,20 @@ const projectRoot = path.resolve(__dirname, "..");
 const bridgePort = clampInt(args["bridge-port"], 8787, 1, 65535);
 const relayPort = clampInt(args["relay-port"], 9797, 1, 65535);
 const withLocalRelay = toBool(args["with-local-relay"]);
-const relayUrl = trim(args.relay) || trim(process.env.AGENT_RELAY_URL) || (withLocalRelay ? `http://localhost:${relayPort}` : "");
+const defaultPublicRelayUrl = "https://agent-companion-relay.onrender.com";
+const relayUrl = withLocalRelay
+  ? trim(args.relay) || trim(process.env.AGENT_RELAY_URL) || `http://localhost:${relayPort}`
+  : trim(args.relay) || trim(process.env.AGENT_RELAY_URL) || defaultPublicRelayUrl;
 const companionName = trim(args.name);
 const companionStateFile = trim(args["state-file"]);
 const bridgeToken = trim(args["bridge-token"]) || trim(process.env.AGENT_BRIDGE_TOKEN);
-
-if (!relayUrl) {
-  printUsageAndExit(1, "relay URL is required unless --with-local-relay is provided.");
-}
+const verbose = toBool(args.verbose) || toBool(process.env.AGENT_VERBOSE);
 
 const bridgeBaseUrl = `http://localhost:${bridgePort}`;
 const childSpecs = [];
 
-printAgentCompanionBanner();
+console.log("Starting Agent Companion laptop service...");
+console.log("");
 
 childSpecs.push({
   name: "bridge",
@@ -73,10 +73,6 @@ if (withLocalRelay) {
   await waitForHealth(`${relayUrl}/health`, 15_000, "relay");
 }
 
-printInfoLine("bridge", bridgeBaseUrl);
-printInfoLine("relay", relayUrl);
-console.log("");
-
 const companionArgs = [
   "scripts/laptop-companion.mjs",
   "--bridge",
@@ -97,7 +93,10 @@ if (bridgeToken) {
 
 const companion = spawn(process.execPath, companionArgs, {
   cwd: projectRoot,
-  env: process.env,
+  env: {
+    ...process.env,
+    AGENT_COMPANION_QUIET: verbose ? "0" : "1"
+  },
   stdio: ["ignore", "pipe", "pipe"]
 });
 companion.stdout.pipe(process.stdout);
@@ -112,6 +111,15 @@ companion.on("close", (code) => {
 });
 
 function attachLogs(name, child) {
+  if (!verbose) {
+    child.on("close", (code) => {
+      if (shuttingDown) return;
+      if (Number.isInteger(code) && code === 0) return;
+      console.error(`[laptop-service] ${name} exited with code ${code ?? "unknown"}`);
+    });
+    return;
+  }
+
   child.stdout.on("data", (chunk) => {
     process.stdout.write(`[${name}] ${chunk}`);
   });
@@ -201,7 +209,7 @@ function printUsageAndExit(code, error = "") {
     console.error(`[laptop-service] ${error}`);
   }
   console.log(`Usage:
-  node scripts/laptop-service.mjs --relay <url> [options]
+  node scripts/laptop-service.mjs [--relay <url>] [options]
   node scripts/laptop-service.mjs --with-local-relay [options]
 
 Options:

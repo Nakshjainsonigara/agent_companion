@@ -4,16 +4,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import qrcode from "qrcode-terminal";
 import WebSocket from "ws";
-import { printInfoLine } from "./banner.mjs";
 
 const argv = process.argv.slice(2);
 const args = parseArgs(argv);
 
-const relayBaseUrl = trimTrailingSlash(args.relay || process.env.AGENT_RELAY_URL || "http://localhost:9797");
+const relayBaseUrl = trimTrailingSlash(args.relay || process.env.AGENT_RELAY_URL || "https://agent-companion-relay.onrender.com");
 const bridgeBaseUrl = trimTrailingSlash(args.bridge || process.env.AGENT_LOCAL_BRIDGE_URL || "http://localhost:8787");
 const bridgeToken = String(args.bridgeToken || process.env.AGENT_BRIDGE_TOKEN || "").trim();
+const quietLogs = String(args.quiet || process.env.AGENT_COMPANION_QUIET || "1").trim() !== "0";
 const snapshotIntervalMs = clamp(toInt(args["snapshot-interval"], 4000), 1000, 60_000);
 const rpcTimeoutMs = clamp(toInt(args["rpc-timeout"], 12_000), 1000, 60_000);
 const bridgeStartupTimeoutMs = clamp(toInt(args["bridge-startup-timeout"], 9000), 2000, 60_000);
@@ -198,22 +197,14 @@ async function registerLaptopWithRetry() {
 }
 
 function printPairingInfo(registration) {
-  printInfoLine("pair", registration.pairCode);
-  if (registration.pairingUrl) {
-    printInfoLine("url", registration.pairingUrl);
+  console.log("");
+  console.log("Agent Companion laptop is ready.");
+  console.log(`Pairing code: ${registration.pairCode}`);
+  console.log("Enter this code in the app to pair.");
+  if (!quietLogs && registration.pairingUrl) {
+    console.log(`Pair URL: ${registration.pairingUrl}`);
   }
   console.log("");
-
-  const qrPayload =
-    safeText(registration.pairingUrl, 4000) ||
-    JSON.stringify(
-      registration.pairingPayload || {
-        relayUrl: relayBaseUrl,
-        code: registration.pairCode
-      }
-    );
-
-  qrcode.generate(qrPayload, { small: true });
 }
 
 function connectWebSocketOnce(laptopToken) {
@@ -227,6 +218,9 @@ function connectWebSocketOnce(laptopToken) {
       reconnectDelayMs = 1200;
       startSnapshotLoop(socket);
       void pushSnapshot(socket);
+      if (!quietLogs) {
+        console.log("[companion] connected to relay");
+      }
     });
 
     socket.on("message", (chunk, isBinary) => {
@@ -250,12 +244,18 @@ function connectWebSocketOnce(laptopToken) {
       stopSnapshotLoop();
 
       const reason = Buffer.isBuffer(reasonRaw) ? reasonRaw.toString("utf8") : String(reasonRaw || "");
-      console.error(`[companion] websocket closed (${code})${reason ? ` ${reason}` : ""}`);
+      if (!quietLogs) {
+        console.error(`[companion] websocket closed (${code})${reason ? ` ${reason}` : ""}`);
+      } else if (!shuttingDown) {
+        console.error("[companion] disconnected from relay, retrying...");
+      }
       resolve();
     });
 
     socket.on("error", (error) => {
-      console.error(`[companion] websocket error: ${String(error?.message || error)}`);
+      if (!quietLogs) {
+        console.error(`[companion] websocket error: ${String(error?.message || error)}`);
+      }
     });
   });
 }
@@ -444,7 +444,9 @@ function startBridgeIfNeeded(targetBridgeUrl) {
   }
 
   const port = resolveBridgePort(targetBridgeUrl);
-  console.log(`[companion] local bridge unreachable, starting bridge/server.mjs on port ${port}`);
+  if (!quietLogs) {
+    console.log(`[companion] local bridge unreachable, starting bridge/server.mjs on port ${port}`);
+  }
 
   const childEnv = {
     ...process.env,
@@ -462,13 +464,15 @@ function startBridgeIfNeeded(targetBridgeUrl) {
   });
   bridgeStartedByCompanion = true;
 
-  bridgeChild.stdout.on("data", (chunk) => {
-    process.stdout.write(`[local-bridge] ${chunk}`);
-  });
+  if (!quietLogs) {
+    bridgeChild.stdout.on("data", (chunk) => {
+      process.stdout.write(`[local-bridge] ${chunk}`);
+    });
 
-  bridgeChild.stderr.on("data", (chunk) => {
-    process.stderr.write(`[local-bridge] ${chunk}`);
-  });
+    bridgeChild.stderr.on("data", (chunk) => {
+      process.stderr.write(`[local-bridge] ${chunk}`);
+    });
+  }
 
   bridgeChild.on("close", (code) => {
     if (shuttingDown) return;
@@ -698,7 +702,9 @@ async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
 
-  console.log(`[companion] received ${signal}, shutting down`);
+  if (!quietLogs) {
+    console.log(`[companion] received ${signal}, shutting down`);
+  }
   stopSnapshotLoop();
 
   if (websocket && websocket.readyState === WebSocket.OPEN) {
