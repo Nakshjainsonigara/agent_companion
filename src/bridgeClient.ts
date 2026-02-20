@@ -69,6 +69,12 @@ type SessionMessageInput = {
   sessionId: string;
   text: string;
 };
+type CreateWorkspaceInput = {
+  name: string;
+  parentPath?: string;
+  workspaceRoot?: string;
+};
+type SettingsUpdateInput = Partial<SettingsPrefs>;
 
 type PairingFailure = "INVALID_CODE" | "EXPIRED" | "NETWORK_ERROR" | "UNKNOWN";
 
@@ -242,6 +248,39 @@ export async function fetchWorkspaces(config?: ClientConfig): Promise<Workspace[
     bridgeAuth: true
   });
   return data?.workspaces ?? [];
+}
+
+export async function createWorkspace(
+  configOrInput: ClientConfig | CreateWorkspaceInput,
+  maybeInput?: CreateWorkspaceInput
+): Promise<Workspace | null> {
+  const { config, input } = normalizeCreateWorkspaceArgs(configOrInput, maybeInput);
+  const resolved = resolveClientConfig(config);
+  const data = await requestJson<{ ok: boolean; workspace: Workspace }>(resolved, {
+    method: "POST",
+    pathLocal: "/api/launcher/workspaces/create",
+    pathRemote: devicePath(resolved, "/launcher/workspaces/create"),
+    timeoutMs: 4500,
+    bridgeAuth: true,
+    body: input
+  });
+  return data?.workspace ?? null;
+}
+
+export async function updateSettings(
+  configOrInput: ClientConfig | SettingsUpdateInput,
+  maybeInput?: SettingsUpdateInput
+): Promise<SettingsPrefs | null> {
+  const { config, input } = normalizeUpdateSettingsArgs(configOrInput, maybeInput);
+  const resolved = resolveClientConfig(config);
+  const data = await requestJson<{ ok: boolean; settings: SettingsPrefs }>(resolved, {
+    method: "POST",
+    pathLocal: "/api/settings/update",
+    pathRemote: devicePath(resolved, "/settings/update"),
+    timeoutMs: 3200,
+    body: input
+  });
+  return data?.settings ?? null;
 }
 
 export async function fetchLauncherRuns(config?: ClientConfig): Promise<LauncherRun[]> {
@@ -499,6 +538,40 @@ function normalizeSessionMessageArgs(
   return {
     config: DEFAULT_CLIENT_CONFIG,
     input: configOrInput as SessionMessageInput
+  };
+}
+
+function normalizeCreateWorkspaceArgs(
+  configOrInput: ClientConfig | CreateWorkspaceInput,
+  maybeInput?: CreateWorkspaceInput
+) {
+  if (maybeInput) {
+    return {
+      config: configOrInput as ClientConfig,
+      input: maybeInput
+    };
+  }
+
+  return {
+    config: DEFAULT_CLIENT_CONFIG,
+    input: configOrInput as CreateWorkspaceInput
+  };
+}
+
+function normalizeUpdateSettingsArgs(
+  configOrInput: ClientConfig | SettingsUpdateInput,
+  maybeInput?: SettingsUpdateInput
+) {
+  if (maybeInput) {
+    return {
+      config: configOrInput as ClientConfig,
+      input: maybeInput
+    };
+  }
+
+  return {
+    config: DEFAULT_CLIENT_CONFIG,
+    input: configOrInput as SettingsUpdateInput
   };
 }
 

@@ -102,6 +102,7 @@ export interface SettingsPrefs {
   metadataOnly: boolean;
   darkLocked: boolean;
   networkOnline: boolean;
+  workspaceRoot: string;
 }
 
 export interface Workspace {

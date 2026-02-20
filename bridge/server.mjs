@@ -14,6 +14,8 @@ const BRIDGE_TOKEN = String(process.env.AGENT_BRIDGE_TOKEN || "").trim();
 const ALLOW_ANY_WORKSPACE =
   String(process.env.AGENT_BRIDGE_ALLOW_ANY_WORKSPACE || "true").trim().toLowerCase() !== "false";
 const WORKSPACE_ROOTS = resolveWorkspaceRoots();
+const DEFAULT_WORKSPACE_ROOT = resolveDefaultWorkspaceRoot();
+const WORKSPACE_MARKER_FILES = [".git", ".vscode", "package.json", "pyproject.toml", "go.mod", "Cargo.toml"];
 const MAX_LAUNCHER_RUN_OUTPUT_LINES = 80;
 const MAX_LAUNCHER_RUNS = 150;
 const MAX_CHAT_TURNS = 4000;
@@ -274,22 +276,48 @@ function resolveWorkspaceRoots() {
   return resolved;
 }
 
+function resolveDefaultWorkspaceRoot() {
+  const preferred = [
+    path.join(os.homedir(), "Documents"),
+    path.join(os.homedir(), "Desktop"),
+    WORKSPACE_ROOTS[0] || "",
+    process.cwd()
+  ].filter(Boolean);
+
+  for (const candidate of preferred) {
+    const normalized = normalizeExistingDirectoryPath(candidate);
+    if (normalized) return normalized;
+  }
+
+  return process.cwd();
+}
+
+function normalizeExistingDirectoryPath(inputPath) {
+  if (typeof inputPath !== "string" || !inputPath.trim()) return "";
+  try {
+    const absolute = path.resolve(inputPath.trim());
+    const real = fs.realpathSync(absolute);
+    const stat = fs.statSync(real);
+    if (!stat.isDirectory()) return "";
+    return real;
+  } catch {
+    return "";
+  }
+}
+
+function getWorkspaceRootSetting() {
+  const fromSettings = normalizeExistingDirectoryPath(safeTrimmedText(state?.settings?.workspaceRoot, 1000));
+  return fromSettings || DEFAULT_WORKSPACE_ROOT;
+}
+
 function isPathInside(root, target) {
   if (root === target) return true;
   return target.startsWith(`${root}${path.sep}`);
 }
 
 function normalizeWorkspacePath(inputPath) {
-  if (typeof inputPath !== "string" || !inputPath.trim()) return null;
-  try {
-    const absolute = path.resolve(inputPath.trim());
-    const real = fs.realpathSync(absolute);
-    const stat = fs.statSync(real);
-    if (!stat.isDirectory()) return null;
-    return real;
-  } catch {
-    return null;
-  }
+  const normalized = normalizeExistingDirectoryPath(inputPath);
+  return normalized || null;
 }
 
 function isWorkspaceAllowed(workspacePath) {
@@ -635,10 +663,15 @@ function listSessionThreadSummaries() {
 
 function listWorkspaceCandidates(limit = 100) {
   const candidates = new Map();
-  const markerFiles = [".git", ".vscode", "package.json", "pyproject.toml", "go.mod", "Cargo.toml"];
+  const preferredRoot = getWorkspaceRootSetting();
+  const scanRoots = [...WORKSPACE_ROOTS];
+  if (preferredRoot && !scanRoots.includes(preferredRoot)) {
+    scanRoots.unshift(preferredRoot);
+  }
 
-  for (const root of WORKSPACE_ROOTS) {
-    collectWorkspaceCandidate(root);
+  for (const root of scanRoots) {
+    const forceChildren = root === preferredRoot;
+    collectWorkspaceCandidate(root, forceChildren);
 
     let entries = [];
     try {
@@ -650,7 +683,7 @@ function listWorkspaceCandidates(limit = 100) {
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
       if (entry.name.startsWith(".") && entry.name !== ".vscode") continue;
-      collectWorkspaceCandidate(path.join(root, entry.name));
+      collectWorkspaceCandidate(path.join(root, entry.name), forceChildren);
       if (candidates.size >= limit) break;
     }
   }
@@ -667,35 +700,122 @@ function listWorkspaceCandidates(limit = 100) {
 
   function collectWorkspaceCandidate(dirPath, force = false) {
     if (candidates.has(dirPath)) return;
-
-    let stat;
-    try {
-      stat = fs.statSync(dirPath);
-    } catch {
-      return;
-    }
-    if (!stat.isDirectory()) return;
-
-    let score = 0;
-    let hasGit = false;
-
-    for (const marker of markerFiles) {
-      if (fs.existsSync(path.join(dirPath, marker))) {
-        score += marker === ".git" ? 3 : 1;
-        if (marker === ".git") hasGit = true;
-      }
-    }
-
-    if (!force && score === 0) return;
-
-    candidates.set(dirPath, {
-      path: dirPath,
-      name: path.basename(dirPath),
-      hasGit,
-      score,
-      lastModified: stat.mtimeMs
-    });
+    const workspace = describeWorkspaceCandidate(dirPath);
+    if (!workspace) return;
+    if (!force && workspace.score === 0) return;
+    candidates.set(dirPath, workspace);
   }
+}
+
+function describeWorkspaceCandidate(dirPath) {
+  const normalized = normalizeExistingDirectoryPath(dirPath);
+  if (!normalized) return null;
+
+  let stat;
+  try {
+    stat = fs.statSync(normalized);
+  } catch {
+    return null;
+  }
+  if (!stat.isDirectory()) return null;
+
+  let score = 0;
+  let hasGit = false;
+
+  for (const marker of WORKSPACE_MARKER_FILES) {
+    if (fs.existsSync(path.join(normalized, marker))) {
+      score += marker === ".git" ? 3 : 1;
+      if (marker === ".git") hasGit = true;
+    }
+  }
+
+  return {
+    path: normalized,
+    name: path.basename(normalized),
+    hasGit,
+    score,
+    lastModified: stat.mtimeMs
+  };
+}
+
+function sanitizeWorkspaceName(value) {
+  const raw = safeTrimmedText(value, 120);
+  if (!raw) return "";
+
+  const normalized = raw
+    .replace(/[\\/]+/g, " ")
+    .replace(/[<>:"|?*\u0000-\u001F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized || normalized === "." || normalized === "..") return "";
+  return normalized;
+}
+
+function createWorkspaceFolder(input) {
+  const name = sanitizeWorkspaceName(input?.name || input?.workspaceName || input?.folderName);
+  if (!name) {
+    return { statusCode: 400, error: "workspace name is required" };
+  }
+
+  const explicitParent = safeTrimmedText(input?.parentPath || input?.workspaceRoot, 1000);
+  const parentPath = normalizeExistingDirectoryPath(explicitParent) || getWorkspaceRootSetting();
+  if (!parentPath) {
+    return { statusCode: 400, error: "workspace root is not configured" };
+  }
+
+  if (!ALLOW_ANY_WORKSPACE && !WORKSPACE_ROOTS.some((root) => isPathInside(root, parentPath))) {
+    return {
+      statusCode: 403,
+      error: "workspace root is outside allowed roots",
+      workspaceRoots: WORKSPACE_ROOTS
+    };
+  }
+
+  const targetPath = path.resolve(parentPath, name);
+  if (!isPathInside(parentPath, targetPath)) {
+    return { statusCode: 400, error: "invalid workspace name" };
+  }
+
+  if (!ALLOW_ANY_WORKSPACE && !WORKSPACE_ROOTS.some((root) => isPathInside(root, targetPath))) {
+    return {
+      statusCode: 403,
+      error: "workspacePath is outside allowed roots",
+      workspaceRoots: WORKSPACE_ROOTS
+    };
+  }
+
+  let created = false;
+  try {
+    if (fs.existsSync(targetPath)) {
+      const stat = fs.statSync(targetPath);
+      if (!stat.isDirectory()) {
+        return { statusCode: 409, error: "path exists and is not a directory" };
+      }
+    } else {
+      fs.mkdirSync(targetPath, { recursive: false });
+      created = true;
+    }
+  } catch (error) {
+    return { statusCode: 500, error: String(error?.message || error) };
+  }
+
+  const normalizedPath = normalizeExistingDirectoryPath(targetPath);
+  if (!normalizedPath) {
+    return { statusCode: 500, error: "workspace path could not be resolved" };
+  }
+
+  const workspace = describeWorkspaceCandidate(normalizedPath);
+  if (!workspace) {
+    return { statusCode: 500, error: "workspace could not be indexed" };
+  }
+
+  return {
+    statusCode: created ? 201 : 200,
+    workspace,
+    created,
+    parentPath
+  };
 }
 
 function detectWorkspaceMeta(workspacePath) {
@@ -1697,7 +1817,8 @@ app.get("/api/launcher/config", (_req, res) => {
     bridgeUrl: BRIDGE_URL,
     tokenRequired: Boolean(BRIDGE_TOKEN),
     allowAnyWorkspace: ALLOW_ANY_WORKSPACE,
-    workspaceRoots: WORKSPACE_ROOTS
+    workspaceRoots: WORKSPACE_ROOTS,
+    defaultWorkspaceRoot: getWorkspaceRootSetting()
   });
 });
 
@@ -1708,7 +1829,26 @@ app.get("/api/launcher/workspaces", (req, res) => {
     ok: true,
     allowAnyWorkspace: ALLOW_ANY_WORKSPACE,
     workspaceRoots: WORKSPACE_ROOTS,
+    defaultWorkspaceRoot: getWorkspaceRootSetting(),
     workspaces
+  });
+});
+
+app.post("/api/launcher/workspaces/create", (req, res) => {
+  const result = createWorkspaceFolder(req.body || {});
+  if (!result.workspace) {
+    return res.status(result.statusCode || 400).json({
+      ok: false,
+      error: result.error || "unable to create workspace",
+      workspaceRoots: result.workspaceRoots || WORKSPACE_ROOTS
+    });
+  }
+
+  return res.status(result.statusCode || 201).json({
+    ok: true,
+    created: result.created,
+    workspace: result.workspace,
+    parentPath: result.parentPath
   });
 });
 
@@ -1775,10 +1915,35 @@ app.post("/api/launcher/runs/:runId/stop", (req, res) => {
 });
 
 app.post("/api/settings/update", (req, res) => {
+  const payload = req.body && typeof req.body === "object" ? req.body : {};
+  const wantsWorkspaceRoot = Object.prototype.hasOwnProperty.call(payload, "workspaceRoot");
+  const workspaceRootRaw = safeTrimmedText(payload.workspaceRoot, 1000);
+  let nextWorkspaceRoot = getWorkspaceRootSetting();
+
+  if (wantsWorkspaceRoot) {
+    if (!workspaceRootRaw) {
+      nextWorkspaceRoot = DEFAULT_WORKSPACE_ROOT;
+    } else {
+      const normalizedRoot = normalizeExistingDirectoryPath(workspaceRootRaw);
+      if (!normalizedRoot) {
+        return res.status(400).json({ ok: false, error: "workspaceRoot must be an existing local directory" });
+      }
+      if (!ALLOW_ANY_WORKSPACE && !WORKSPACE_ROOTS.some((root) => isPathInside(root, normalizedRoot))) {
+        return res.status(403).json({
+          ok: false,
+          error: "workspaceRoot is outside allowed roots",
+          workspaceRoots: WORKSPACE_ROOTS
+        });
+      }
+      nextWorkspaceRoot = normalizedRoot;
+    }
+  }
+
   withPersist(() => {
     state.settings = {
       ...state.settings,
-      ...req.body,
+      ...payload,
+      workspaceRoot: nextWorkspaceRoot,
       darkLocked: true
     };
   });

@@ -169,5 +169,6 @@ export const initialSettings: SettingsPrefs = {
   pairingHealthy: true,
   metadataOnly: true,
   darkLocked: true,
-  networkOnline: true
+  networkOnline: true,
+  workspaceRoot: ""
 };

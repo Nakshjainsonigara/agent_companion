@@ -354,6 +354,16 @@ app.get("/api/devices/:id/launcher/workspaces", async (req, res) => {
   });
 });
 
+app.post("/api/devices/:id/launcher/workspaces/create", async (req, res) => {
+  return proxyToLaptopBridge(req, res, {
+    method: "POST",
+    path: "/api/launcher/workspaces/create",
+    body: req.body || {},
+    autoWake: true,
+    wakeIntent: "create_workspace"
+  });
+});
+
 app.get("/api/devices/:id/launcher/runs", async (req, res) => {
   const pathWithQuery = withQuery("/api/launcher/runs", req.query);
   return proxyToLaptopBridge(req, res, {
@@ -378,6 +388,16 @@ app.post("/api/devices/:id/launcher/runs/:runId/stop", async (req, res) => {
     method: "POST",
     path: `/api/launcher/runs/${runId}/stop`,
     body: req.body || {}
+  });
+});
+
+app.post("/api/devices/:id/settings/update", async (req, res) => {
+  return proxyToLaptopBridge(req, res, {
+    method: "POST",
+    path: "/api/settings/update",
+    body: req.body || {},
+    autoWake: true,
+    wakeIntent: "update_settings"
   });
 });
 

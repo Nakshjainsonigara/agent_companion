@@ -1,3 +1,7 @@
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
 const SESSION_STATES = new Set(["RUNNING", "WAITING_INPUT", "COMPLETED", "FAILED", "CANCELLED"]);
 const EVENT_CATEGORIES = new Set(["INFO", "ACTION", "INPUT", "ERROR"]);
 const TURN_ROLES = new Set(["USER", "ASSISTANT"]);
@@ -52,6 +56,35 @@ function normalizeTurnRole(value) {
 
 function normalizeTurnKind(value) {
   return TURN_KINDS.has(value) ? value : "MESSAGE";
+}
+
+function resolveDefaultWorkspaceRoot() {
+  const preferred = [path.join(os.homedir(), "Documents"), path.join(os.homedir(), "Desktop"), process.cwd()];
+  for (const candidate of preferred) {
+    try {
+      const absolute = path.resolve(candidate);
+      const real = fs.realpathSync(absolute);
+      const stat = fs.statSync(real);
+      if (stat.isDirectory()) return real;
+    } catch {
+      continue;
+    }
+  }
+  return process.cwd();
+}
+
+function normalizeWorkspaceRoot(value, fallback = "") {
+  const fromInput = safeTrimmedText(value, 1000);
+  if (!fromInput) return fallback;
+  try {
+    const absolute = path.resolve(fromInput);
+    const real = fs.realpathSync(absolute);
+    const stat = fs.statSync(real);
+    if (!stat.isDirectory()) return fallback;
+    return real;
+  } catch {
+    return fallback;
+  }
 }
 
 function sanitizeTokenUsage(input, fallback = null) {
@@ -345,7 +378,8 @@ export function buildDefaultState() {
     pairingHealthy: true,
     metadataOnly: true,
     darkLocked: true,
-    networkOnline: true
+    networkOnline: true,
+    workspaceRoot: resolveDefaultWorkspaceRoot()
   };
 
   const sessionThreads = buildDefaultThreads(sessions);
@@ -446,16 +480,20 @@ export function sanitizeState(raw) {
     .sort((a, b) => a.createdAt - b.createdAt);
 
   return {
+    settings:
+      candidate.settings && typeof candidate.settings === "object"
+        ? {
+            ...fallback.settings,
+            ...candidate.settings,
+            workspaceRoot: normalizeWorkspaceRoot(candidate.settings.workspaceRoot, fallback.settings.workspaceRoot)
+          }
+        : fallback.settings,
     source: "bridge",
     sessions,
     sessionThreads,
     chatTurns,
     pendingInputs,
     events,
-    pendingHandledAt: sanitizePendingHandledAt(candidate.pendingHandledAt),
-    settings:
-      candidate.settings && typeof candidate.settings === "object"
-        ? { ...fallback.settings, ...candidate.settings }
-        : fallback.settings
+    pendingHandledAt: sanitizePendingHandledAt(candidate.pendingHandledAt)
   };
 }

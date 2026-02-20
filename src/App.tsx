@@ -6,6 +6,7 @@ import {
   ChevronRight,
   Clock3,
   Folder,
+  FolderPlus,
   FolderGit2,
   LayoutDashboard,
   Link,
@@ -26,6 +27,7 @@ import {
 import {
   claimPairingCode,
   clearPairingConfig,
+  createWorkspace,
   DEFAULT_CLIENT_CONFIG,
   fetchDeviceStatus,
   fetchSessionRuns,
@@ -37,10 +39,11 @@ import {
   sendSessionMessage,
   stopRun,
   submitBridgeAction,
+  updateSettings,
   type ClientConfig,
   TokenExpiredError,
 } from "./bridgeClient";
-import { initialEvents, initialPendingInputs, initialSessions } from "./mockData";
+import { initialEvents, initialPendingInputs, initialSessions, initialSettings } from "./mockData";
 import {
   type ActionType,
   type AgentSession,
@@ -54,6 +57,7 @@ import {
   type RemoteDeviceStatus,
   type SessionEvent,
   type SessionState,
+  type SettingsPrefs,
   type Workspace,
 } from "./types";
 import { formatRelativeTime } from "./utils";
@@ -163,6 +167,9 @@ function App() {
   const [toast, setToast] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [networkOnline, setNetworkOnline] = useState(navigator.onLine);
+  const [settingsPrefs, setSettingsPrefs] = useState<SettingsPrefs>(initialSettings);
+  const [workspaceRootDraft, setWorkspaceRootDraft] = useState(initialSettings.workspaceRoot);
+  const [isSavingWorkspaceRoot, setIsSavingWorkspaceRoot] = useState(false);
 
   // Pairing state
   const [pairingConfig, setPairingConfig] = useState<PairingConfig | null>(() => {
@@ -182,6 +189,9 @@ function App() {
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [workspacesLoading, setWorkspacesLoading] = useState(false);
   const [workspacePickerOpen, setWorkspacePickerOpen] = useState(false);
+  const [createWorkspaceOpen, setCreateWorkspaceOpen] = useState(false);
+  const [newWorkspaceName, setNewWorkspaceName] = useState("");
+  const [isCreatingWorkspace, setIsCreatingWorkspace] = useState(false);
   const [agentPickerOpen, setAgentPickerOpen] = useState(false);
   const [runSessionPickerOpen, setRunSessionPickerOpen] = useState(false);
 
@@ -246,6 +256,12 @@ function App() {
       setPendingInputs(snapshot.pendingInputs);
       setEvents(snapshot.events);
       setChatTurns((previous) => mergeChatTurnsFromSnapshot(snapshot.chatTurns ?? [], previous, Date.now()));
+      if (snapshot.settings) {
+        setSettingsPrefs((previous) => ({ ...previous, ...snapshot.settings }));
+        if (snapshot.settings.workspaceRoot) {
+          setWorkspaceRootDraft((previous) => previous || snapshot.settings.workspaceRoot);
+        }
+      }
       return true;
     } catch (error) {
       if (error instanceof TokenExpiredError) {
@@ -409,6 +425,12 @@ function App() {
     const timeout = window.setTimeout(() => setToast(null), 2000);
     return () => window.clearTimeout(timeout);
   }, [toast]);
+
+  useEffect(() => {
+    if (workspacePickerOpen) return;
+    setCreateWorkspaceOpen(false);
+    setNewWorkspaceName("");
+  }, [workspacePickerOpen]);
 
   const sessionById = useMemo(() => {
     const map = new Map<string, AgentSession>();
@@ -641,6 +663,84 @@ function App() {
           return;
         }
         setToast("Action failed");
+      }
+    })();
+  };
+
+  const handleSaveWorkspaceRoot = () => {
+    if (isSavingWorkspaceRoot) return;
+    const nextRoot = workspaceRootDraft.trim();
+    if (!nextRoot) {
+      setToast("Enter a folder path");
+      return;
+    }
+
+    setIsSavingWorkspaceRoot(true);
+
+    void (async () => {
+      try {
+        const updated = await updateSettings(clientConfig, {
+          workspaceRoot: nextRoot,
+        });
+        setIsSavingWorkspaceRoot(false);
+
+        if (!updated) {
+          setToast("Unable to save location");
+          return;
+        }
+
+        setSettingsPrefs((previous) => ({ ...previous, ...updated }));
+        setWorkspaceRootDraft(updated.workspaceRoot || nextRoot);
+        setToast("Default location saved");
+      } catch (error) {
+        setIsSavingWorkspaceRoot(false);
+        if (error instanceof TokenExpiredError) {
+          handleTokenExpired();
+          return;
+        }
+        setToast("Unable to save location");
+      }
+    })();
+  };
+
+  const handleCreateWorkspace = () => {
+    const name = newWorkspaceName.trim();
+    if (!name || isCreatingWorkspace) return;
+    if (!pairingConfig) return;
+
+    const parentPath = workspaceRootDraft.trim() || settingsPrefs.workspaceRoot || "";
+
+    setIsCreatingWorkspace(true);
+
+    void (async () => {
+      try {
+        const workspace = await createWorkspace(clientConfig, {
+          name,
+          parentPath: parentPath || undefined,
+        });
+        setIsCreatingWorkspace(false);
+
+        if (!workspace) {
+          setToast("Workspace create failed");
+          return;
+        }
+
+        setWorkspaces((previous) => {
+          const next = [workspace, ...previous.filter((item) => item.path !== workspace.path)];
+          next.sort((a, b) => b.lastModified - a.lastModified);
+          return next;
+        });
+        setRunWorkspace(workspace);
+        setNewWorkspaceName("");
+        setCreateWorkspaceOpen(false);
+        setToast("Workspace ready");
+      } catch (error) {
+        setIsCreatingWorkspace(false);
+        if (error instanceof TokenExpiredError) {
+          handleTokenExpired();
+          return;
+        }
+        setToast("Workspace create failed");
       }
     })();
   };
@@ -1148,6 +1248,45 @@ function App() {
 
                   {workspacePickerOpen && (
                     <div className="absolute left-0 right-0 top-full z-10 mt-1 max-h-48 overflow-y-auto rounded-xl border border-white/[0.06] bg-surface backdrop-blur-xl">
+                      <div className="border-b border-white/[0.05] px-2 py-2">
+                        <button
+                          onClick={() => setCreateWorkspaceOpen((previous) => !previous)}
+                          className="flex w-full items-center gap-2 rounded-lg px-2 py-1.5 text-left text-[12px] font-medium text-foreground/80 transition hover:bg-white/[0.04]"
+                        >
+                          <FolderPlus className="h-3.5 w-3.5 text-brand-openai" />
+                          New workspace
+                        </button>
+
+                        {createWorkspaceOpen && (
+                          <div className="mt-2 rounded-lg border border-white/[0.06] bg-white/[0.02] p-2">
+                            <Input
+                              value={newWorkspaceName}
+                              onChange={(event) => setNewWorkspaceName(event.target.value)}
+                              onKeyDown={(event) => {
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  handleCreateWorkspace();
+                                }
+                              }}
+                              placeholder="Folder name"
+                              className="h-8"
+                            />
+                            <p className="mt-1.5 truncate font-mono text-[10px] text-muted-foreground/45">
+                              {workspaceRootDraft.trim() || settingsPrefs.workspaceRoot || "Using laptop default root"}
+                            </p>
+                            <Button
+                              size="sm"
+                              className="mt-2 w-full"
+                              onClick={handleCreateWorkspace}
+                              disabled={!newWorkspaceName.trim() || isCreatingWorkspace}
+                            >
+                              {isCreatingWorkspace ? <Loader2 className="mr-1.5 h-3 w-3 animate-spin" /> : null}
+                              Create
+                            </Button>
+                          </div>
+                        )}
+                      </div>
+
                       {workspacesLoading ? (
                         <div className="flex items-center justify-center py-4">
                           <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />
@@ -1658,6 +1797,28 @@ function App() {
               <div className="py-3">
                 <p className="text-[11px] text-muted-foreground/65">Relay URL (read-only)</p>
                 <Input value={pairingConfig.relayBaseUrl || pairRelayUrl} readOnly className="mt-1 h-8 font-mono text-[11px]" />
+              </div>
+
+              <div className="divider" />
+
+              <div className="py-3">
+                <p className="text-[11px] text-muted-foreground/65">Default workspace location</p>
+                <Input
+                  value={workspaceRootDraft}
+                  onChange={(event) => setWorkspaceRootDraft(event.target.value)}
+                  placeholder={settingsPrefs.workspaceRoot || "/Users/you/Documents"}
+                  className="mt-1 h-8 font-mono text-[11px]"
+                />
+                <p className="mt-1 text-[10px] text-muted-foreground/45">New workspace from phone will be created in this folder.</p>
+                <Button
+                  size="sm"
+                  className="mt-2 w-full"
+                  onClick={handleSaveWorkspaceRoot}
+                  disabled={!workspaceRootDraft.trim() || isSavingWorkspaceRoot}
+                >
+                  {isSavingWorkspaceRoot ? <Loader2 className="mr-1.5 h-3 w-3 animate-spin" /> : null}
+                  Save location
+                </Button>
               </div>
 
               <div className="divider" />
