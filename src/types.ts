@@ -37,6 +37,46 @@ export interface SessionEvent {
   category: "INFO" | "ACTION" | "INPUT" | "ERROR";
 }
 
+export type ChatTurnRole = "USER" | "ASSISTANT";
+export type ChatTurnKind = "MESSAGE" | "FINAL_OUTPUT" | "APPROVAL_ACTION";
+
+export interface ChatTurn {
+  id: string;
+  sessionId: string;
+  role: ChatTurnRole;
+  kind: ChatTurnKind;
+  text: string;
+  createdAt: number;
+  runId?: string | null;
+  approvalId?: string | null;
+  source?: string;
+}
+
+export interface SessionThreadSummary {
+  id: string;
+  turnCount: number;
+  pendingApprovals: number;
+  lastTurn?: ChatTurn | null;
+  latestRun?: LauncherRun | null;
+  thread?: {
+    id: string;
+    key: string;
+    lookupKey: string;
+    agentType: AgentType;
+    workspacePath: string;
+    repo: string;
+    branch: string;
+    title: string;
+    normalizedTitle: string;
+    createdAt: number;
+    updatedAt: number;
+    lastRunId: string | null;
+    runCount: number;
+    lastMessageAt: number;
+  } | null;
+  session?: AgentSession | null;
+}
+
 export interface PendingInput {
   id: string;
   sessionId: string;
@@ -72,6 +112,16 @@ export interface Workspace {
   lastModified: number;
 }
 
+export interface SessionsSnapshot {
+  sessions: AgentSession[];
+  pendingInputs: PendingInput[];
+  events: SessionEvent[];
+  chatTurns?: ChatTurn[];
+  sessionSummaries?: SessionThreadSummary[];
+  settings?: SettingsPrefs;
+  source?: string;
+}
+
 export interface PairingConfig {
   mode: BridgeMode;
   relayBaseUrl: string;
@@ -99,6 +149,7 @@ export interface LauncherRun {
   workspacePath: string;
   repo: string;
   branch: string;
+  command?: string[];
   status: LauncherRunStatus;
   createdAt: number;
   startedAt: number | null;
@@ -114,4 +165,17 @@ export interface LauncherRun {
   skipPermissions?: boolean;
   planMode?: boolean;
   outputTail: string[];
+}
+
+export interface LaunchTaskInput {
+  agentType: AgentType;
+  workspacePath: string;
+  prompt: string;
+  command?: string[];
+  title?: string;
+  sessionId?: string;
+  newThread?: boolean;
+  fullWorkspaceAccess?: boolean;
+  skipPermissions?: boolean;
+  planMode?: boolean;
 }

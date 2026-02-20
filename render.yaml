@@ -13,3 +13,7 @@ services:
         value: 20
       - key: RELAY_PUBLIC_URL
         sync: false
+      - key: RELAY_WAKE_PROXY_URL
+        sync: false
+      - key: RELAY_WAKE_PROXY_TOKEN
+        sync: false

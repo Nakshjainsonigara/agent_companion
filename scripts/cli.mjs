@@ -22,6 +22,8 @@ if (command === "laptop") {
   runNodeScript(path.resolve(projectRoot, "relay", "server.mjs"), rest);
 } else if (command === "bridge") {
   runNodeScript(path.resolve(projectRoot, "bridge", "server.mjs"), rest);
+} else if (command === "wake-proxy") {
+  runNodeScript(path.resolve(projectRoot, "wake-proxy", "server.mjs"), rest);
 } else {
   console.error(`[agent-companion] unknown command "${command}"`);
   printHelp(1);
@@ -50,11 +52,13 @@ function printHelp(exitCode) {
   agent-companion laptop --with-local-relay
   agent-companion relay
   agent-companion bridge
+  agent-companion wake-proxy
 
 Examples:
   agent-companion laptop
   agent-companion laptop --relay https://agent-companion-relay.onrender.com
   agent-companion laptop --with-local-relay
+  agent-companion wake-proxy
 `);
   process.exit(exitCode);
 }

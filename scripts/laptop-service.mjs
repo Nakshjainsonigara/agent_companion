@@ -21,6 +21,7 @@ const relayUrl = withLocalRelay
 const companionName = trim(args.name);
 const companionStateFile = trim(args["state-file"]);
 const bridgeToken = trim(args["bridge-token"]) || trim(process.env.AGENT_BRIDGE_TOKEN);
+const wakeMac = trim(args["wake-mac"]) || trim(args.wakeMac) || trim(process.env.AGENT_WAKE_MAC);
 const verbose = toBool(args.verbose) || toBool(process.env.AGENT_VERBOSE);
 
 const bridgeBaseUrl = `http://localhost:${bridgePort}`;
@@ -89,6 +90,9 @@ if (companionStateFile) {
 }
 if (bridgeToken) {
   companionArgs.push("--bridgeToken", bridgeToken);
+}
+if (wakeMac) {
+  companionArgs.push("--wake-mac", wakeMac);
 }
 
 const companion = spawn(process.execPath, companionArgs, {
@@ -219,6 +223,7 @@ Options:
   --relay-public-url <url>      Public URL relay announces (default local URL)
   --bridge-port <port>          Bridge port (default: 8787)
   --bridge-token <token>        Optional bridge token
+  --wake-mac <mac>              Optional Wake-on-LAN MAC (AA:BB:CC:DD:EE:FF)
   --name <label>                Laptop display name for pairing
   --state-file <path>           Companion state file path
 `);

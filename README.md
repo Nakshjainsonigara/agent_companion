@@ -11,6 +11,7 @@ Premium dark **web/PWA** for monitoring Codex + Claude Code sessions from phone.
 - Direct monitoring of local Codex and Claude Code history files (no wrapper required).
 - Phone-triggered local task launcher (no GitHub required).
 - Relay pairing flow for phone-to-laptop remote control.
+- Auto-wake support for sleeping laptops (Wake-on-LAN via wake proxy).
 
 ## 0) Full remote pairing flow (phone + laptop)
 This is the end-to-end path when users are not on the same local network.
@@ -44,10 +45,35 @@ Phone-side API contract (with `Authorization: Bearer <phoneToken>`):
 - `GET /api/devices/:id/status`
 - `GET /api/devices/:id/bootstrap`
 - `POST /api/devices/:id/actions`
+- `POST /api/devices/:id/sessions/:sessionId/messages`
 - `GET /api/devices/:id/launcher/workspaces`
 - `GET /api/devices/:id/launcher/runs`
 - `POST /api/devices/:id/launcher/start`
 - `POST /api/devices/:id/launcher/runs/:runId/stop`
+- `POST /api/devices/:id/wake`
+
+## 0.25) Auto-wake for sleeping laptops
+To wake a sleeping laptop automatically before a run/message, deploy the wake proxy on an always-on device in the same LAN as the laptop (small VM, mini-PC, NAS, router host, etc).
+
+Wake proxy:
+```bash
+cd /Users/nakshjain/Desktop/agent
+npm run wake-proxy
+```
+
+Relay environment:
+- `RELAY_WAKE_PROXY_URL=https://<wake-proxy-host>`
+- `RELAY_WAKE_PROXY_TOKEN=<shared-secret>` (optional but recommended)
+
+Wake proxy environment:
+- `WAKE_PROXY_TOKEN=<shared-secret>` (must match relay token if set)
+- `WAKE_BROADCAST_ADDRESS=255.255.255.255` (or subnet broadcast)
+- `WAKE_UDP_PORT=9`
+
+Laptop companion auto-detects MAC address and registers it with relay. You can override:
+```bash
+npm run laptop:service -- --wake-mac AA:BB:CC:DD:EE:FF
+```
 
 ## 0.5) One-command laptop service (recommended packaging)
 Run bridge + companion together from one command:
@@ -75,6 +101,7 @@ Notes:
 - `--with-local-relay` is for local/dev only unless you expose relay publicly.
 - Default public relay is `https://agent-companion-relay.onrender.com`.
 - Override relay via `--relay` only when needed.
+- Optional `--wake-mac` sets/overrides Wake-on-LAN MAC.
 - Companion prints pair code only (no QR).
 
 ## 0.6) Deploy relay on Render (free)
@@ -84,7 +111,8 @@ Quick path:
 1. Push this repo to GitHub.
 2. In Render, create a new **Blueprint** service from that repo.
 3. Set env var `RELAY_PUBLIC_URL` to your Render HTTPS URL (for example `https://agent-companion-relay.onrender.com`).
-4. Deploy.
+4. (Optional auto-wake) Set `RELAY_WAKE_PROXY_URL` and `RELAY_WAKE_PROXY_TOKEN`.
+5. Deploy.
 
 After deploy:
 ```bash

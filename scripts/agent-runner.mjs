@@ -478,14 +478,29 @@ function normalizeCommand(commandArgs, options = {}) {
     console.log("[agent-runner] enabled Codex plan mode (`--sandbox read-only`)");
   }
 
-  if (fullWorkspaceAccess && !commandArgs.includes("--dangerously-bypass-approvals-and-sandbox")) {
-    commandArgs.splice(2, 0, "--dangerously-bypass-approvals-and-sandbox");
-    console.log("[agent-runner] enabled dangerous full workspace access for Codex");
-  }
+  if (fullWorkspaceAccess || skipPermissions) {
+    removeFlagWithValue(commandArgs, "--sandbox", "-s");
+    removeFlagWithValue(commandArgs, "--ask-for-approval", "-a");
 
-  if (skipPermissions && !commandArgs.includes("--dangerously-bypass-approvals-and-sandbox")) {
-    commandArgs.splice(2, 0, "--dangerously-bypass-approvals-and-sandbox");
-    console.log("[agent-runner] enabled dangerous permission bypass for Codex");
+    if (!commandArgs.includes("--sandbox")) {
+      commandArgs.splice(2, 0, "--sandbox", "danger-full-access");
+    }
+    if (
+      !commandArgs.includes("--dangerously-bypass-approvals-and-sandbox") &&
+      !commandArgs.includes("--yolo")
+    ) {
+      commandArgs.splice(2, 0, "--dangerously-bypass-approvals-and-sandbox");
+    }
+
+    if (fullWorkspaceAccess) {
+      console.log(
+        "[agent-runner] enabled Codex full access (`--sandbox danger-full-access` + dangerous bypass)"
+      );
+    } else {
+      console.log(
+        "[agent-runner] enabled Codex permission bypass (`--sandbox danger-full-access` + dangerous bypass)"
+      );
+    }
   }
 }
 
@@ -514,6 +529,19 @@ function normalizeClaudeCommand(commandArgs, options = {}) {
   ) {
     commandArgs.splice(1, 0, "--permission-mode", "plan");
     console.log("[agent-runner] enabled Claude plan mode (`--permission-mode plan`)");
+  }
+}
+
+function removeFlagWithValue(args, longFlag, shortFlag) {
+  for (let index = 0; index < args.length; index += 1) {
+    const token = args[index];
+    if (token !== longFlag && token !== shortFlag) continue;
+
+    args.splice(index, 1);
+    if (index < args.length && !String(args[index] || "").startsWith("-")) {
+      args.splice(index, 1);
+    }
+    index -= 1;
   }
 }
 

@@ -17,7 +17,8 @@
     "pending:add": "node scripts/add-pending.mjs",
     "bridge:reset": "node scripts/reset-bridge.mjs",
     "build": "tsc -b && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "wake-proxy": "node wake-proxy/server.mjs"
   },
   "bin": {
     "agent-companion": "scripts/cli.mjs"

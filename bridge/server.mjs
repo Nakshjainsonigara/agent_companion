@@ -16,6 +16,8 @@ const ALLOW_ANY_WORKSPACE =
 const WORKSPACE_ROOTS = resolveWorkspaceRoots();
 const MAX_LAUNCHER_RUN_OUTPUT_LINES = 80;
 const MAX_LAUNCHER_RUNS = 150;
+const MAX_CHAT_TURNS = 4000;
+const MAX_TRANSCRIPT_SEGMENTS_PER_RUN = 220;
 
 const app = express();
 app.use(cors());
@@ -53,6 +55,13 @@ function withPersist(mutator) {
     sessions: state.sessions
       .slice()
       .sort((a, b) => b.lastUpdated - a.lastUpdated),
+    sessionThreads: (Array.isArray(state.sessionThreads) ? state.sessionThreads : [])
+      .slice()
+      .sort((a, b) => safeNumber(b.updatedAt, 0) - safeNumber(a.updatedAt, 0)),
+    chatTurns: (Array.isArray(state.chatTurns) ? state.chatTurns : [])
+      .slice()
+      .sort((a, b) => safeNumber(a.createdAt, 0) - safeNumber(b.createdAt, 0))
+      .slice(-MAX_CHAT_TURNS),
     events: state.events
       .slice()
       .sort((a, b) => b.timestamp - a.timestamp)
@@ -106,10 +115,20 @@ function upsertSession(input) {
 
   if (!existing) {
     state.sessions.push(next);
+    syncSessionThreadFromSession(next, {
+      workspacePath: input?.workspacePath,
+      threadLookupKey: input?.threadLookupKey,
+      updatedAt: next.lastUpdated
+    });
     return next;
   }
 
   Object.assign(existing, next);
+  syncSessionThreadFromSession(existing, {
+    workspacePath: input?.workspacePath,
+    threadLookupKey: input?.threadLookupKey,
+    updatedAt: existing.lastUpdated
+  });
   return existing;
 }
 
@@ -157,6 +176,15 @@ function addPendingInput(input) {
   const existing = state.pendingInputs.find((item) => item.id === pending.id);
   if (!existing) {
     state.pendingInputs.unshift(pending);
+    appendChatTurn({
+      sessionId,
+      role: "ASSISTANT",
+      kind: "MESSAGE",
+      text: pending.prompt,
+      createdAt: pending.requestedAt,
+      approvalId: pending.id,
+      source: "PENDING"
+    });
     if (state.pendingHandledAt && typeof state.pendingHandledAt === "object") {
       delete state.pendingHandledAt[pending.id];
     }
@@ -166,6 +194,20 @@ function addPendingInput(input) {
   if (session) {
     session.state = "WAITING_INPUT";
     session.lastUpdated = Date.now();
+    syncSessionThreadFromSession(session, {
+      updatedAt: session.lastUpdated,
+      lastMessageAt: pending.requestedAt
+    });
+  } else {
+    upsertSessionThread({
+      id: sessionId,
+      agentType: "CODEX",
+      title: "Untitled session",
+      repo: "unknown-repo",
+      branch: "main",
+      updatedAt: pending.requestedAt,
+      lastMessageAt: pending.requestedAt
+    });
   }
 
   return pending;
@@ -289,7 +331,198 @@ function normalizeLookupText(value) {
     .replace(/\s+/g, " ");
 }
 
-function findMatchingSessionId(agentType, repo, title) {
+function normalizeThreadTitle(value) {
+  const normalized = normalizeLookupText(value)
+    .replace(/[^a-z0-9 ]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized || "untitled";
+}
+
+function normalizeWorkspaceLookup(workspacePath, repo) {
+  const normalizedPath = safeTrimmedText(workspacePath, 500);
+  if (normalizedPath) {
+    return normalizedPath.toLowerCase();
+  }
+  const normalizedRepo = normalizeLookupText(repo);
+  return normalizedRepo ? `repo:${normalizedRepo}` : "repo:unknown";
+}
+
+function buildSessionThreadLookupKey(input) {
+  const agentType = normalizeAgentType(input?.agentType);
+  const workspaceKey = normalizeWorkspaceLookup(input?.workspacePath, input?.repo);
+  const titleKey = normalizeThreadTitle(input?.title);
+  return `${agentType}|${workspaceKey}|${titleKey}`;
+}
+
+function findSessionThread(sessionId) {
+  const id = safeTrimmedText(sessionId, 160);
+  if (!id) return null;
+  return (Array.isArray(state.sessionThreads) ? state.sessionThreads : []).find((item) => item.id === id) || null;
+}
+
+function findLatestSessionThreadByLookupKey(lookupKey) {
+  const target = safeTrimmedText(lookupKey, 640);
+  if (!target) return null;
+
+  return (Array.isArray(state.sessionThreads) ? state.sessionThreads : [])
+    .slice()
+    .sort((a, b) => safeNumber(b.updatedAt, 0) - safeNumber(a.updatedAt, 0))
+    .find((thread) => safeTrimmedText(thread.lookupKey || thread.key, 640) === target) || null;
+}
+
+function upsertSessionThread(input) {
+  const now = Date.now();
+  const id = safeTrimmedText(input?.id, 160);
+  if (!id) return null;
+
+  if (!Array.isArray(state.sessionThreads)) {
+    state.sessionThreads = [];
+  }
+
+  const existing = findSessionThread(id);
+  const agentType = normalizeAgentType(input?.agentType || existing?.agentType);
+  const title = safeTrimmedText(input?.title, 140) || safeTrimmedText(existing?.title, 140) || "Untitled session";
+  const repo = safeTrimmedText(input?.repo, 120) || safeTrimmedText(existing?.repo, 120) || "unknown-repo";
+  const branch = safeTrimmedText(input?.branch, 120) || safeTrimmedText(existing?.branch, 120) || "main";
+  const workspacePath =
+    safeTrimmedText(input?.workspacePath, 500) || safeTrimmedText(existing?.workspacePath, 500) || "";
+  const normalizedTitle = normalizeThreadTitle(input?.normalizedTitle || title);
+  const lookupKey =
+    safeTrimmedText(input?.lookupKey || input?.key, 640) ||
+    safeTrimmedText(existing?.lookupKey || existing?.key, 640) ||
+    buildSessionThreadLookupKey({
+      agentType,
+      workspacePath,
+      repo,
+      title: normalizedTitle
+    });
+  const runCount = Math.max(
+    0,
+    safeInt(input?.runCount, safeInt(existing?.runCount, 0))
+  );
+
+  const next = {
+    id,
+    key: lookupKey,
+    lookupKey,
+    agentType,
+    workspacePath,
+    repo,
+    branch,
+    title,
+    normalizedTitle,
+    createdAt: safeNumber(input?.createdAt, safeNumber(existing?.createdAt, now)),
+    updatedAt: safeNumber(input?.updatedAt, now),
+    lastRunId: safeTrimmedText(input?.lastRunId, 160) || safeTrimmedText(existing?.lastRunId, 160) || null,
+    runCount,
+    lastMessageAt: safeNumber(input?.lastMessageAt, safeNumber(existing?.lastMessageAt, 0))
+  };
+
+  if (!existing) {
+    state.sessionThreads.push(next);
+    return next;
+  }
+
+  Object.assign(existing, next);
+  return existing;
+}
+
+function syncSessionThreadFromSession(session, input = {}) {
+  if (!session?.id) return null;
+  const existingThread = findSessionThread(session.id);
+  const fallbackLookupKey = buildSessionThreadLookupKey({
+    agentType: session.agentType,
+    workspacePath: input.workspacePath || existingThread?.workspacePath || "",
+    repo: session.repo,
+    title: session.title
+  });
+
+  return upsertSessionThread({
+    id: session.id,
+    agentType: session.agentType,
+    workspacePath: safeTrimmedText(input.workspacePath, 500) || existingThread?.workspacePath || "",
+    repo: session.repo,
+    branch: session.branch,
+    title: session.title,
+    normalizedTitle: normalizeThreadTitle(session.title),
+    key: safeTrimmedText(input.threadLookupKey, 640) || existingThread?.key || fallbackLookupKey,
+    lookupKey: safeTrimmedText(input.threadLookupKey, 640) || existingThread?.lookupKey || fallbackLookupKey,
+    createdAt: safeNumber(input.createdAt, safeNumber(existingThread?.createdAt, session.lastUpdated)),
+    updatedAt: safeNumber(input.updatedAt, safeNumber(session.lastUpdated, Date.now())),
+    lastRunId: safeTrimmedText(input.lastRunId, 160) || existingThread?.lastRunId || null,
+    runCount: safeInt(input.runCount, safeInt(existingThread?.runCount, 0)),
+    lastMessageAt: safeNumber(
+      input.lastMessageAt,
+      safeNumber(existingThread?.lastMessageAt, safeNumber(session.lastUpdated, 0))
+    )
+  });
+}
+
+function sanitizeTurnText(value, maxLength = 12000) {
+  const text = String(value ?? "")
+    .replace(/\u0000/g, "")
+    .replace(/\r\n/g, "\n")
+    .trim();
+  if (!text) return "";
+  return text.slice(0, maxLength);
+}
+
+function appendChatTurn(input) {
+  const sessionId = safeTrimmedText(input?.sessionId, 160);
+  const text = sanitizeTurnText(input?.text);
+  if (!sessionId || !text) return null;
+
+  if (!Array.isArray(state.chatTurns)) {
+    state.chatTurns = [];
+  }
+
+  const role = input?.role === "ASSISTANT" ? "ASSISTANT" : "USER";
+  const allowedKinds = new Set(["MESSAGE", "FINAL_OUTPUT", "APPROVAL_ACTION"]);
+  const kind = allowedKinds.has(input?.kind) ? input.kind : "MESSAGE";
+  const turn = {
+    id: safeTrimmedText(input?.id, 180) || `turn_${Date.now()}_${Math.floor(Math.random() * 1000)}`,
+    sessionId,
+    role,
+    kind,
+    text,
+    createdAt: safeNumber(input?.createdAt, Date.now()),
+    runId: safeTrimmedText(input?.runId, 160) || null,
+    approvalId: safeTrimmedText(input?.approvalId, 160) || null,
+    source: safeTrimmedText(input?.source, 48) || "BRIDGE"
+  };
+
+  const duplicate = state.chatTurns.find((item) => item.id === turn.id);
+  if (duplicate) {
+    return duplicate;
+  }
+
+  state.chatTurns.push(turn);
+  return turn;
+}
+
+function listChatTurnsForSession(sessionId) {
+  const id = safeTrimmedText(sessionId, 160);
+  if (!id) return [];
+
+  return (Array.isArray(state.chatTurns) ? state.chatTurns : [])
+    .filter((turn) => turn.sessionId === id)
+    .slice()
+    .sort((a, b) => safeNumber(a.createdAt, 0) - safeNumber(b.createdAt, 0));
+}
+
+function findLastTurnForSession(sessionId) {
+  const turns = listChatTurnsForSession(sessionId);
+  return turns.length > 0 ? turns[turns.length - 1] : null;
+}
+
+function findMatchingSessionId(agentType, workspacePath, repo, title) {
+  const lookupKey = buildSessionThreadLookupKey({ agentType, workspacePath, repo, title });
+  const matchedThread = findLatestSessionThreadByLookupKey(lookupKey);
+  if (matchedThread?.id) {
+    return matchedThread.id;
+  }
+
   const normalizedRepo = normalizeLookupText(repo);
   const normalizedTitle = normalizeLookupText(title);
   if (!normalizedRepo || !normalizedTitle) return "";
@@ -306,6 +539,98 @@ function findMatchingSessionId(agentType, repo, title) {
   }
 
   return "";
+}
+
+function findActiveRunForSession(sessionId) {
+  return [...launcherRuns.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .find((run) => run.sessionId === sessionId && (run.status === "RUNNING" || run.status === "STARTING")) || null;
+}
+
+function writeToRunStdin(run, message) {
+  const target = run;
+  if (
+    !target?.child ||
+    !target.child.stdin ||
+    target.child.stdin.destroyed ||
+    !target.child.stdin.writable
+  ) {
+    return false;
+  }
+
+  try {
+    target.child.stdin.write(message);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function buildEphemeralSessionThread(session) {
+  if (!session?.id) return null;
+  const lookupKey = buildSessionThreadLookupKey({
+    agentType: session.agentType,
+    workspacePath: "",
+    repo: session.repo,
+    title: session.title
+  });
+  return {
+    id: session.id,
+    key: lookupKey,
+    lookupKey,
+    agentType: session.agentType,
+    workspacePath: "",
+    repo: session.repo,
+    branch: session.branch,
+    title: session.title,
+    normalizedTitle: normalizeThreadTitle(session.title),
+    createdAt: safeNumber(session.lastUpdated, Date.now()),
+    updatedAt: safeNumber(session.lastUpdated, Date.now()),
+    lastRunId: null,
+    runCount: 0,
+    lastMessageAt: safeNumber(session.lastUpdated, 0)
+  };
+}
+
+function getSessionThreadSummary(sessionId) {
+  const id = safeTrimmedText(sessionId, 160);
+  if (!id) return null;
+
+  const session = findSession(id);
+  const thread = findSessionThread(id);
+  if (!session && !thread) return null;
+  const turns = listChatTurnsForSession(id);
+  const lastTurn = turns.length > 0 ? turns[turns.length - 1] : null;
+  const pendingApprovals = state.pendingInputs.filter((item) => item.sessionId === id);
+  const latestRun = [...launcherRuns.values()]
+    .filter((run) => run.sessionId === id)
+    .sort((a, b) => b.createdAt - a.createdAt)[0];
+
+  return {
+    id,
+    thread: thread || buildEphemeralSessionThread(session),
+    session: session || null,
+    turnCount: turns.length,
+    lastTurn,
+    pendingApprovals,
+    latestRun: latestRun ? serializeRun(latestRun) : null
+  };
+}
+
+function listSessionThreadSummaries() {
+  const threadIds = new Set((Array.isArray(state.sessionThreads) ? state.sessionThreads : []).map((item) => item.id));
+  for (const session of state.sessions) {
+    threadIds.add(session.id);
+  }
+
+  return [...threadIds]
+    .map((id) => getSessionThreadSummary(id))
+    .filter(Boolean)
+    .sort(
+      (a, b) =>
+        safeNumber(b.thread?.updatedAt, safeNumber(b.session?.lastUpdated, 0)) -
+        safeNumber(a.thread?.updatedAt, safeNumber(a.session?.lastUpdated, 0))
+    );
 }
 
 function listWorkspaceCandidates(limit = 100) {
@@ -436,7 +761,8 @@ function buildPlanPrompt(prompt) {
 }
 
 function createLauncherRun(input) {
-  const requestedSessionId = safeTrimmedText(input?.sessionId, 120);
+  const forceNewThread = safeBoolean(input?.newThread, false);
+  const requestedSessionId = forceNewThread ? "" : safeTrimmedText(input?.sessionId, 120);
   const runId = `run_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
   const agentType = normalizeAgentType(input?.agentType);
   const workspacePath = normalizeWorkspacePath(input?.workspacePath);
@@ -470,14 +796,27 @@ function createLauncherRun(input) {
     safeTrimmedText(input?.title, 140) ||
     safeTrimmedText(effectivePrompt || input?.prompt, 140) ||
     `${agentType} local task`;
-  const matchedSessionId = requestedSessionId || findMatchingSessionId(agentType, workspaceMeta.repo, title);
+  const threadLookupKey = buildSessionThreadLookupKey({
+    agentType,
+    workspacePath,
+    repo: workspaceMeta.repo,
+    title
+  });
+  const matchedSessionId =
+    requestedSessionId ||
+    (forceNewThread ? "" : findMatchingSessionId(agentType, workspacePath, workspaceMeta.repo, title));
   const sessionId =
     matchedSessionId || `${agentType.toLowerCase()}_${Date.now()}_${Math.floor(Math.random() * 1000)}`;
-  const reusedExistingSession = Boolean(matchedSessionId && findSession(matchedSessionId));
+  const reusedExistingSession = Boolean(
+    matchedSessionId &&
+      (findSession(matchedSessionId) || findSessionThread(matchedSessionId))
+  );
+  const existingThread = findSessionThread(sessionId);
 
   const run = {
     id: runId,
     sessionId,
+    threadLookupKey,
     agentType,
     title,
     prompt: effectivePrompt || safeTrimmedText(input?.prompt, 1500),
@@ -488,7 +827,8 @@ function createLauncherRun(input) {
     launchOptions: {
       fullWorkspaceAccess,
       skipPermissions,
-      planMode
+      planMode,
+      newThread: forceNewThread
     },
     status: "STARTING",
     createdAt: Date.now(),
@@ -501,6 +841,7 @@ function createLauncherRun(input) {
     codexThreadId: null,
     resumeCommand: null,
     stopRequested: false,
+    assistantOutputSegments: [],
     outputTail: []
   };
 
@@ -512,8 +853,11 @@ function createLauncherRun(input) {
     if (run.launchOptions.fullWorkspaceAccess) launchMode.push("full-workspace-access");
     if (run.launchOptions.skipPermissions) launchMode.push("skip-permissions");
     if (run.launchOptions.planMode) launchMode.push("plan-mode");
+    if (run.launchOptions.newThread) launchMode.push("new-thread");
     const launchSuffix = launchMode.length > 0 ? ` (${launchMode.join(", ")})` : "";
     const reuseSuffix = reusedExistingSession ? " [reused existing session]" : "";
+    const promptTokens = run.prompt ? safeInt(run.prompt.length / 4, 0) : 0;
+    const now = Date.now();
 
     upsertSession({
       id: run.sessionId,
@@ -523,19 +867,50 @@ function createLauncherRun(input) {
       branch: run.branch,
       state: "RUNNING",
       progress: 2,
-      lastUpdated: Date.now(),
+      lastUpdated: now,
+      workspacePath: run.workspacePath,
+      threadLookupKey: run.threadLookupKey,
       tokenUsage: {
-        promptTokens: 0,
+        promptTokens,
         completionTokens: 0,
-        totalTokens: 0,
+        totalTokens: promptTokens,
         costUsd: 0
       }
     });
+    upsertSessionThread({
+      id: run.sessionId,
+      agentType: run.agentType,
+      key: run.threadLookupKey,
+      lookupKey: run.threadLookupKey,
+      workspacePath: run.workspacePath,
+      repo: run.repo,
+      branch: run.branch,
+      title: run.title,
+      normalizedTitle: normalizeThreadTitle(run.title),
+      createdAt: safeNumber(existingThread?.createdAt, now),
+      updatedAt: now,
+      lastRunId: run.id,
+      runCount: safeInt(existingThread?.runCount, 0) + 1,
+      lastMessageAt: now
+    });
+
+    if (run.prompt) {
+      appendChatTurn({
+        sessionId: run.sessionId,
+        role: "USER",
+        kind: "MESSAGE",
+        text: run.prompt,
+        runId: run.id,
+        createdAt: now,
+        source: "LAUNCH"
+      });
+    }
+
     addEvent({
       sessionId: run.sessionId,
       summary: `Launch requested from phone for ${run.repo}${launchSuffix}${reuseSuffix}.`,
       category: "ACTION",
-      timestamp: Date.now()
+      timestamp: now
     });
   });
 
@@ -599,7 +974,9 @@ function createLauncherRun(input) {
           branch: run.branch,
           state: "FAILED",
           progress: 100,
-          lastUpdated: Date.now()
+          lastUpdated: Date.now(),
+          workspacePath: run.workspacePath,
+          threadLookupKey: run.threadLookupKey
         });
         addEvent({
           sessionId: run.sessionId,
@@ -615,6 +992,7 @@ function createLauncherRun(input) {
       run.signal = signal ?? null;
       run.endedAt = Date.now();
       run.child = null;
+      const finalOutputText = deriveAssistantFinalOutput(run);
 
       if (run.stopRequested) {
         run.status = "STOPPED";
@@ -628,8 +1006,21 @@ function createLauncherRun(input) {
             branch: run.branch,
             state: "CANCELLED",
             progress: 100,
-            lastUpdated: Date.now()
+            lastUpdated: Date.now(),
+            workspacePath: run.workspacePath,
+            threadLookupKey: run.threadLookupKey
           });
+          if (finalOutputText) {
+            appendChatTurn({
+              sessionId: run.sessionId,
+              role: "ASSISTANT",
+              kind: "FINAL_OUTPUT",
+              text: finalOutputText,
+              runId: run.id,
+              createdAt: Date.now(),
+              source: "RUN_OUTPUT"
+            });
+          }
           addEvent({
             sessionId: run.sessionId,
             summary: "Session stopped from phone.",
@@ -639,6 +1030,32 @@ function createLauncherRun(input) {
         });
       } else {
         run.status = run.exitCode === 0 ? "COMPLETED" : "FAILED";
+        withPersist(() => {
+          upsertSession({
+            id: run.sessionId,
+            agentType: run.agentType,
+            title: run.title,
+            repo: run.repo,
+            branch: run.branch,
+            state: run.status,
+            progress: 100,
+            lastUpdated: Date.now(),
+            workspacePath: run.workspacePath,
+            threadLookupKey: run.threadLookupKey
+          });
+
+          if (finalOutputText) {
+            appendChatTurn({
+              sessionId: run.sessionId,
+              role: "ASSISTANT",
+              kind: "FINAL_OUTPUT",
+              text: finalOutputText,
+              runId: run.id,
+              createdAt: Date.now(),
+              source: "RUN_OUTPUT"
+            });
+          }
+        });
       }
     });
   } catch (error) {
@@ -655,7 +1072,9 @@ function createLauncherRun(input) {
         branch: run.branch,
         state: "FAILED",
         progress: 100,
-        lastUpdated: Date.now()
+        lastUpdated: Date.now(),
+        workspacePath: run.workspacePath,
+        threadLookupKey: run.threadLookupKey
       });
       addEvent({
         sessionId: run.sessionId,
@@ -669,22 +1088,151 @@ function createLauncherRun(input) {
   return { run };
 }
 
+function stripAnsi(text) {
+  return String(text || "").replace(/\u001b\[[0-9;]*m/g, "");
+}
+
+function tryParseJsonLine(line) {
+  const trimmed = line.trim();
+  if (!trimmed || trimmed[0] !== "{") return null;
+  try {
+    return JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+}
+
+function extractTextFromContent(content) {
+  if (typeof content === "string") {
+    return [content];
+  }
+
+  if (!Array.isArray(content)) {
+    if (content && typeof content === "object") {
+      const candidate =
+        safeTrimmedText(content.text, 40_000) ||
+        safeTrimmedText(content.value, 40_000) ||
+        safeTrimmedText(content.message, 40_000);
+      return candidate ? [candidate] : [];
+    }
+    return [];
+  }
+
+  const extracted = [];
+  for (const item of content) {
+    if (!item || typeof item !== "object") continue;
+    const candidate =
+      safeTrimmedText(item.text, 40_000) ||
+      safeTrimmedText(item.value, 40_000) ||
+      safeTrimmedText(item.message, 40_000);
+    if (candidate) {
+      extracted.push(candidate);
+    }
+  }
+  return extracted;
+}
+
+function extractAssistantSegmentsFromJson(payload) {
+  if (!payload || typeof payload !== "object") return [];
+
+  if (payload.type === "item.completed" && payload.item && typeof payload.item === "object") {
+    if (payload.item.type === "agent_message") {
+      return extractTextFromContent(payload.item.text || payload.item.content);
+    }
+  }
+
+  if (payload.type === "event_msg" && payload.payload && payload.payload.type === "agent_message") {
+    return extractTextFromContent(payload.payload.message || payload.payload.content);
+  }
+
+  if (payload.type === "response_item" && payload.payload && payload.payload.type === "message") {
+    if (payload.payload.role === "assistant") {
+      return extractTextFromContent(payload.payload.content || payload.payload.message || payload.payload.text);
+    }
+  }
+
+  if (payload.type === "message" && payload.role === "assistant") {
+    return extractTextFromContent(payload.content || payload.text);
+  }
+
+  return [];
+}
+
+function isTranscriptNoiseLine(line) {
+  if (!line) return true;
+  if (/^\[agent-runner\]/i.test(line)) return true;
+  if (/^(session started|session completed|session failed|resume later:|codex thread ready:)/i.test(line)) {
+    return true;
+  }
+  if (/^(prompt|completion|total)[_\s-]*tokens?\s*[:=]/i.test(line)) return true;
+  if (/^cost(?:[_\s-]*usd)?\s*[:=]/i.test(line)) return true;
+  if (/^\d{4}-\d{2}-\d{2}t/i.test(line) && /\b(error|warn|info|debug)\b/i.test(line)) return true;
+  if (/codex_core::|codex_exec|rollout::list|mcp/i.test(line)) return true;
+  return false;
+}
+
+function collectAssistantSegmentsFromLine(rawLine) {
+  const line = stripAnsi(rawLine).trim();
+  if (!line) return [];
+
+  const parsed = tryParseJsonLine(line);
+  if (parsed) {
+    return extractAssistantSegmentsFromJson(parsed)
+      .map((item) => sanitizeTurnText(item))
+      .filter(Boolean);
+  }
+
+  if (isTranscriptNoiseLine(line)) {
+    return [];
+  }
+
+  return [sanitizeTurnText(line)].filter(Boolean);
+}
+
+function deriveAssistantFinalOutput(run) {
+  const segments = Array.isArray(run?.assistantOutputSegments) ? run.assistantOutputSegments : [];
+  if (segments.length === 0) return "";
+
+  const merged = [];
+  for (const segment of segments) {
+    const cleaned = sanitizeTurnText(segment, 6000);
+    if (!cleaned) continue;
+    if (merged[merged.length - 1] === cleaned) continue;
+    merged.push(cleaned);
+  }
+
+  return sanitizeTurnText(merged.join("\n\n"), 12000);
+}
+
 function appendRunOutput(run, text) {
   if (!text) return;
-  const lines = text
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean);
+  const rawLines = String(text).split(/\r?\n/);
+  const lines = [];
 
-  if (lines.length === 0) return;
+  for (const rawLine of rawLines) {
+    const line = stripAnsi(rawLine).trim();
+    if (!line) continue;
+    lines.push(line);
 
-  for (const line of lines) {
     const threadMatch = line.match(/\[agent-runner\]\s+codex_thread=([0-9a-f-]+)/i);
     if (threadMatch && threadMatch[1]) {
       run.codexThreadId = threadMatch[1];
       run.resumeCommand = `codex exec resume ${threadMatch[1]}`;
     }
+
+    const segments = collectAssistantSegmentsFromLine(rawLine);
+    if (segments.length > 0) {
+      if (!Array.isArray(run.assistantOutputSegments)) {
+        run.assistantOutputSegments = [];
+      }
+      run.assistantOutputSegments.push(...segments);
+      if (run.assistantOutputSegments.length > MAX_TRANSCRIPT_SEGMENTS_PER_RUN) {
+        run.assistantOutputSegments = run.assistantOutputSegments.slice(-MAX_TRANSCRIPT_SEGMENTS_PER_RUN);
+      }
+    }
   }
+
+  if (lines.length === 0) return;
 
   run.outputTail.push(...lines);
   if (run.outputTail.length > MAX_LAUNCHER_RUN_OUTPUT_LINES) {
@@ -705,6 +1253,7 @@ function serializeRun(run) {
   return {
     id: run.id,
     sessionId: run.sessionId,
+    threadLookupKey: run.threadLookupKey ?? null,
     agentType: run.agentType,
     title: run.title,
     prompt: run.prompt,
@@ -715,6 +1264,7 @@ function serializeRun(run) {
     fullWorkspaceAccess: Boolean(run.launchOptions?.fullWorkspaceAccess),
     skipPermissions: Boolean(run.launchOptions?.skipPermissions),
     planMode: Boolean(run.launchOptions?.planMode),
+    newThread: Boolean(run.launchOptions?.newThread),
     status: run.status,
     createdAt: run.createdAt,
     startedAt: run.startedAt,
@@ -745,6 +1295,11 @@ function mergeDirectSnapshot(snapshot) {
       if (!id.startsWith("codex:") && !id.startsWith("claude:")) return true;
       return incomingDirectSessionIds.has(id);
     });
+    state.sessionThreads = (Array.isArray(state.sessionThreads) ? state.sessionThreads : []).filter((item) => {
+      const id = String(item?.id || "");
+      if (!id.startsWith("codex:") && !id.startsWith("claude:")) return true;
+      return incomingDirectSessionIds.has(id);
+    });
   }
 
   const existingSessions = new Map(state.sessions.map((item) => [item.id, item]));
@@ -753,8 +1308,14 @@ function mergeDirectSnapshot(snapshot) {
     const previous = existingSessions.get(incoming.id);
     if (previous) {
       Object.assign(previous, incoming);
+      syncSessionThreadFromSession(previous, {
+        updatedAt: safeNumber(previous.lastUpdated, Date.now())
+      });
     } else {
       state.sessions.push(incoming);
+      syncSessionThreadFromSession(incoming, {
+        updatedAt: safeNumber(incoming.lastUpdated, Date.now())
+      });
     }
   }
 
@@ -820,13 +1381,264 @@ function mergeDirectSnapshot(snapshot) {
   }
 }
 
+function buildBootstrapPayload() {
+  const sessionSummaries = listSessionThreadSummaries().map((item) => ({
+    id: item.id,
+    thread: item.thread,
+    session: item.session,
+    turnCount: item.turnCount,
+    lastTurn: item.lastTurn,
+    pendingApprovals: item.pendingApprovals,
+    latestRun: item.latestRun
+  }));
+
+  return {
+    ...state,
+    source: "bridge",
+    sessionSummaries
+  };
+}
+
+function normalizeActionType(value) {
+  const normalized = String(value || "")
+    .trim()
+    .toUpperCase();
+  if (normalized === "APPROVE" || normalized === "REJECT" || normalized === "TEXT_REPLY") {
+    return normalized;
+  }
+  if (normalized === "TEXT" || normalized === "REPLY" || normalized === "MESSAGE") {
+    return "TEXT_REPLY";
+  }
+  return "";
+}
+
+function applyPendingAction(input) {
+  const pendingInputId = safeTrimmedText(input?.pendingInputId, 180);
+  const sessionId = safeTrimmedText(input?.sessionId, 160);
+  const type = normalizeActionType(input?.type);
+  const text = sanitizeTurnText(input?.text || "", 3000);
+
+  if (!pendingInputId || !sessionId || !type) {
+    return {
+      statusCode: 400,
+      body: { ok: false, error: "pendingInputId, sessionId, and valid type are required" }
+    };
+  }
+
+  const pending = state.pendingInputs.find((item) => item.id === pendingInputId && item.sessionId === sessionId);
+  if (!pending) {
+    return { statusCode: 404, body: { ok: false, error: "pending input not found" } };
+  }
+
+  const defaultActionable = !String(sessionId).startsWith("codex:") && !String(sessionId).startsWith("claude:");
+  if (!safeBoolean(pending.actionable, defaultActionable)) {
+    return {
+      statusCode: 409,
+      body: {
+        ok: false,
+        error: "pending input is not remotely actionable",
+        hint: "Handle this approval directly in the local CLI session."
+      }
+    };
+  }
+
+  const actionText = type === "APPROVE" ? "approve\n" : type === "REJECT" ? "reject\n" : `${text}\n`;
+  const targetRun = findActiveRunForSession(sessionId);
+  const actionDelivered = writeToRunStdin(targetRun, actionText);
+  const now = Date.now();
+
+  withPersist(() => {
+    state.pendingInputs = state.pendingInputs.filter((item) => item.id !== pendingInputId);
+    state.pendingHandledAt = {
+      ...(state.pendingHandledAt && typeof state.pendingHandledAt === "object" ? state.pendingHandledAt : {}),
+      [pendingInputId]: now
+    };
+
+    const session = findSession(sessionId);
+    if (session) {
+      session.lastUpdated = now;
+
+      if (type === "REJECT") {
+        session.state = "CANCELLED";
+      } else {
+        session.state = "RUNNING";
+        session.progress = Math.min(100, Math.max(0, safeNumber(session.progress, 0) + 3));
+      }
+
+      syncSessionThreadFromSession(session, {
+        updatedAt: now,
+        lastMessageAt: now,
+        lastRunId: targetRun?.id || null
+      });
+    }
+
+    const turnText =
+      type === "APPROVE"
+        ? "Approved"
+        : type === "REJECT"
+          ? "Rejected"
+          : text;
+    appendChatTurn({
+      sessionId,
+      role: "USER",
+      kind: "APPROVAL_ACTION",
+      text: turnText,
+      createdAt: now,
+      runId: targetRun?.id || null,
+      approvalId: pendingInputId,
+      source: "APPROVAL"
+    });
+
+    const summary =
+      type === "APPROVE"
+        ? actionDelivered
+          ? "Input approved from phone. Sent to running agent."
+          : "Input approved from phone. Marked as resolved."
+        : type === "REJECT"
+          ? actionDelivered
+            ? "Input rejected from phone. Sent to running agent."
+            : "Input rejected from phone. Session cancelled."
+          : `Text reply from phone${actionDelivered ? " sent to agent" : ""}: ${text || "(empty)"}`;
+
+    addEvent({ sessionId, summary, category: "ACTION", timestamp: now });
+  });
+
+  return {
+    statusCode: 200,
+    body: { ok: true, delivered: actionDelivered, pendingInputId, sessionId, type }
+  };
+}
+
 app.get("/health", (_req, res) => {
   const activeRuns = [...launcherRuns.values()].filter((run) => run.status === "RUNNING").length;
   res.json({ ok: true, service: "agent-bridge", activeRuns });
 });
 
 app.get("/api/bootstrap", (_req, res) => {
-  res.json({ ...state, source: "bridge" });
+  res.json(buildBootstrapPayload());
+});
+
+app.get("/api/sessions", (_req, res) => {
+  const sessions = listSessionThreadSummaries();
+  return res.json({ ok: true, sessions });
+});
+
+app.get("/api/sessions/:id", (req, res) => {
+  const sessionId = safeTrimmedText(req.params.id, 160);
+  const summary = getSessionThreadSummary(sessionId);
+  if (!summary) {
+    return res.status(404).json({ ok: false, error: "session not found" });
+  }
+  return res.json({ ok: true, session: summary });
+});
+
+app.get("/api/sessions/:id/turns", (req, res) => {
+  const sessionId = safeTrimmedText(req.params.id, 160);
+  const summary = getSessionThreadSummary(sessionId);
+  if (!summary) {
+    return res.status(404).json({ ok: false, error: "session not found" });
+  }
+  const turns = listChatTurnsForSession(sessionId);
+  return res.json({ ok: true, sessionId, turns });
+});
+
+app.post("/api/sessions/:id/messages", (req, res) => {
+  const sessionId = safeTrimmedText(req.params.id, 160);
+  const text = sanitizeTurnText(req.body?.text || req.body?.message || "", 3000);
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: "session id is required" });
+  }
+  if (!text) {
+    return res.status(400).json({ ok: false, error: "text is required" });
+  }
+
+  const existingSession = findSession(sessionId);
+  const existingThread = findSessionThread(sessionId);
+  if (!existingSession && !existingThread) {
+    return res.status(404).json({ ok: false, error: "session not found" });
+  }
+
+  const targetRun = findActiveRunForSession(sessionId);
+  const delivered = writeToRunStdin(targetRun, `${text}\n`);
+  let turn = null;
+
+  withPersist(() => {
+    const now = Date.now();
+    let session = findSession(sessionId);
+    const thread = findSessionThread(sessionId);
+
+    if (!session && thread) {
+      session = upsertSession({
+        id: thread.id,
+        agentType: thread.agentType,
+        title: thread.title,
+        repo: thread.repo,
+        branch: thread.branch,
+        state: delivered ? "RUNNING" : "WAITING_INPUT",
+        progress: 0,
+        lastUpdated: now,
+        workspacePath: thread.workspacePath,
+        threadLookupKey: thread.lookupKey || thread.key
+      });
+    }
+
+    if (session) {
+      session.lastUpdated = now;
+      if (delivered) {
+        session.state = "RUNNING";
+      } else if (session.state === "RUNNING") {
+        session.state = "WAITING_INPUT";
+      }
+      syncSessionThreadFromSession(session, {
+        updatedAt: now,
+        lastMessageAt: now,
+        lastRunId: targetRun?.id || null
+      });
+    } else if (thread) {
+      upsertSessionThread({
+        id: thread.id,
+        updatedAt: now,
+        lastMessageAt: now,
+        lastRunId: targetRun?.id || null
+      });
+    }
+
+    turn = appendChatTurn({
+      sessionId,
+      role: "USER",
+      kind: "MESSAGE",
+      text,
+      createdAt: now,
+      runId: targetRun?.id || null,
+      source: "MESSAGE_API"
+    });
+    addEvent({
+      sessionId,
+      summary: delivered
+        ? `User message sent to running agent: ${text.slice(0, 180)}`
+        : `User message queued for session: ${text.slice(0, 180)}`,
+      category: "ACTION",
+      timestamp: now
+    });
+  });
+
+  return res.status(201).json({ ok: true, delivered, turn });
+});
+
+app.post("/api/sessions/:id/approvals/:approvalId/action", (req, res) => {
+  let actionType = req.body?.type ?? req.body?.action;
+  if (!actionType && typeof req.body?.approved === "boolean") {
+    actionType = req.body.approved ? "APPROVE" : "REJECT";
+  }
+
+  const result = applyPendingAction({
+    pendingInputId: req.params.approvalId,
+    sessionId: req.params.id,
+    type: actionType,
+    text: req.body?.text
+  });
+
+  return res.status(result.statusCode).json(result.body);
 });
 
 app.post("/api/sessions/upsert", (req, res) => {
@@ -873,77 +1685,8 @@ app.post("/api/pending/add", (req, res) => {
 });
 
 app.post("/api/actions", (req, res) => {
-  const { pendingInputId, sessionId, type, text } = req.body || {};
-  if (!pendingInputId || !sessionId || !type) {
-    return res.status(400).json({ ok: false, error: "pendingInputId, sessionId, and type are required" });
-  }
-
-  const pending = state.pendingInputs.find((item) => item.id === pendingInputId && item.sessionId === sessionId);
-  if (!pending) {
-    return res.status(404).json({ ok: false, error: "pending input not found" });
-  }
-  const defaultActionable = !String(sessionId).startsWith("codex:") && !String(sessionId).startsWith("claude:");
-  if (!safeBoolean(pending.actionable, defaultActionable)) {
-    return res.status(409).json({
-      ok: false,
-      error: "pending input is not remotely actionable",
-      hint: "Handle this approval directly in the local CLI session."
-    });
-  }
-
-  const actionText =
-    type === "APPROVE" ? "approve\n" : type === "REJECT" ? "reject\n" : `${String(text || "").trim()}\n`;
-  const targetRun = [...launcherRuns.values()]
-    .sort((a, b) => b.createdAt - a.createdAt)
-    .find((run) => run.sessionId === sessionId && (run.status === "RUNNING" || run.status === "STARTING"));
-  const actionDelivered = Boolean(
-    targetRun?.child &&
-      targetRun.child.stdin &&
-      !targetRun.child.stdin.destroyed &&
-      targetRun.child.stdin.writable
-  );
-  if (actionDelivered) {
-    try {
-      targetRun.child.stdin.write(actionText);
-    } catch {
-      // Keep state transition for UI even if transport fails.
-    }
-  }
-
-  withPersist(() => {
-    state.pendingInputs = state.pendingInputs.filter((item) => item.id !== pendingInputId);
-    state.pendingHandledAt = {
-      ...(state.pendingHandledAt && typeof state.pendingHandledAt === "object" ? state.pendingHandledAt : {}),
-      [pendingInputId]: Date.now()
-    };
-
-    const session = findSession(sessionId);
-    if (session) {
-      session.lastUpdated = Date.now();
-
-      if (type === "REJECT") {
-        session.state = "CANCELLED";
-      } else {
-        session.state = "RUNNING";
-        session.progress = Math.min(100, Math.max(0, safeNumber(session.progress, 0) + 3));
-      }
-    }
-
-    const summary =
-      type === "APPROVE"
-        ? actionDelivered
-          ? "Input approved from phone. Sent to running agent."
-          : "Input approved from phone. Marked as resolved."
-        : type === "REJECT"
-          ? actionDelivered
-            ? "Input rejected from phone. Sent to running agent."
-            : "Input rejected from phone. Session cancelled."
-          : `Text reply from phone${actionDelivered ? " sent to agent" : ""}: ${(text || "").trim() || "(empty)"}`;
-
-    addEvent({ sessionId, summary, category: "ACTION", timestamp: Date.now() });
-  });
-
-  return res.json({ ok: true, delivered: actionDelivered });
+  const result = applyPendingAction(req.body || {});
+  return res.status(result.statusCode).json(result.body);
 });
 
 app.use("/api/launcher", requireBridgeToken);

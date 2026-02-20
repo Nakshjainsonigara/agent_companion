@@ -21,6 +21,11 @@ const companionStateFile = path.resolve(
   String(args["state-file"] || process.env.AGENT_COMPANION_STATE_FILE || path.join(os.homedir(), ".agent-companion", "companion.json"))
 );
 const registerRetryDelayMs = 3000;
+const explicitWakeMac = normalizeMacAddress(
+  args["wake-mac"] || args.wakeMac || process.env.AGENT_WAKE_MAC || process.env.WAKE_MAC || ""
+);
+const detectedWakeMac = detectPrimaryWakeMacAddress();
+const wakeMacAddress = explicitWakeMac || detectedWakeMac || "";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -129,7 +134,10 @@ async function fetchExistingLaptopRegistration(laptopToken) {
           Accept: "application/json",
           Authorization: `Bearer ${laptopToken}`
         },
-        body: JSON.stringify({ force: false })
+        body: JSON.stringify({
+          force: false,
+          ...(wakeMacAddress ? { wakeMac: wakeMacAddress } : {})
+        })
       },
       5000
     );
@@ -161,7 +169,8 @@ async function registerLaptopWithRetry() {
   const payload = {
     name: safeText(args.name, 120) || os.hostname(),
     hostname: os.hostname(),
-    platform: process.platform
+    platform: process.platform,
+    ...(wakeMacAddress ? { wakeMac: wakeMacAddress } : {})
   };
 
   while (!shuttingDown) {
@@ -201,6 +210,13 @@ function printPairingInfo(registration) {
   console.log("Agent Companion laptop is ready.");
   console.log(`Pairing code: ${registration.pairCode}`);
   console.log("Enter this code in the app to pair.");
+  if (!quietLogs) {
+    if (wakeMacAddress) {
+      console.log(`Auto-wake MAC: ${wakeMacAddress}`);
+    } else {
+      console.log("Auto-wake: MAC not detected (set --wake-mac AA:BB:CC:DD:EE:FF)");
+    }
+  }
   if (!quietLogs && registration.pairingUrl) {
     console.log(`Pair URL: ${registration.pairingUrl}`);
   }
@@ -653,6 +669,7 @@ function persistCompanionState(next) {
       pairCode: safeText(next?.pairCode, 32) || null,
       pairingExpiresAt: next?.pairingExpiresAt ? toInt(next.pairingExpiresAt, Date.now()) : null,
       pairingUrl: safeText(next?.pairingUrl, 2000) || null,
+      wakeMac: wakeMacAddress || null,
       updatedAt: Date.now()
     };
 
@@ -752,4 +769,55 @@ function trimTrailingSlash(value) {
   const trimmed = String(value || "").trim();
   if (!trimmed) return "";
   return trimmed.replace(/\/+$/, "");
+}
+
+function detectPrimaryWakeMacAddress() {
+  const interfaces = os.networkInterfaces();
+  const preferredPrefix = [
+    "en",
+    "eth",
+    "wlan",
+    "wi-fi",
+    "wifi",
+    "wl",
+    "thunderbolt"
+  ];
+  const candidates = [];
+
+  for (const [ifaceName, entries] of Object.entries(interfaces || {})) {
+    if (!Array.isArray(entries) || !entries.length) continue;
+    const preferred = preferredPrefix.some((prefix) => ifaceName.toLowerCase().startsWith(prefix));
+
+    for (const entry of entries) {
+      if (!entry || entry.internal) continue;
+      const normalizedMac = normalizeMacAddress(entry.mac);
+      if (!normalizedMac) continue;
+      candidates.push({
+        ifaceName,
+        normalizedMac,
+        preferred
+      });
+      break;
+    }
+  }
+
+  if (!candidates.length) return "";
+
+  const preferredCandidate = candidates.find((item) => item.preferred);
+  if (preferredCandidate) {
+    return preferredCandidate.normalizedMac;
+  }
+
+  return candidates[0].normalizedMac;
+}
+
+function normalizeMacAddress(value) {
+  const raw = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^0-9A-F]/g, "");
+  if (raw.length !== 12) return "";
+  if (raw === "000000000000" || raw === "FFFFFFFFFFFF") return "";
+  const chunks = raw.match(/.{1,2}/g);
+  return chunks ? chunks.join(":") : "";
 }

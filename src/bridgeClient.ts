@@ -2,21 +2,19 @@ import {
   ActionType,
   AgentSession,
   AgentType,
+  LaunchTaskInput,
   LauncherRun,
   PairingConfig,
   PendingInput,
   RemoteDeviceStatus,
   SessionEvent,
+  SessionsSnapshot,
   SettingsPrefs,
   Workspace
 } from "./types";
 
-export interface BridgeSnapshot {
-  sessions: AgentSession[];
-  pendingInputs: PendingInput[];
-  events: SessionEvent[];
+export interface BridgeSnapshot extends SessionsSnapshot {
   settings: SettingsPrefs;
-  source?: string;
 }
 
 export interface ClientConfig {
@@ -66,14 +64,10 @@ type ActionInput = {
   text?: string;
 };
 
-type LaunchInput = {
-  agentType: AgentType;
-  workspacePath: string;
-  prompt: string;
-  title?: string;
-  fullWorkspaceAccess?: boolean;
-  skipPermissions?: boolean;
-  planMode?: boolean;
+type LaunchInput = LaunchTaskInput;
+type SessionMessageInput = {
+  sessionId: string;
+  text: string;
 };
 
 type PairingFailure = "INVALID_CODE" | "EXPIRED" | "NETWORK_ERROR" | "UNKNOWN";
@@ -123,6 +117,10 @@ export function clearPairingConfig() {
 }
 
 export async function fetchBridgeSnapshot(config?: ClientConfig): Promise<BridgeSnapshot | null> {
+  return fetchSessionsSnapshot(config);
+}
+
+export async function fetchSessionsSnapshot(config?: ClientConfig): Promise<BridgeSnapshot | null> {
   const resolved = resolveClientConfig(config);
   return requestJson<BridgeSnapshot>(resolved, {
     method: "GET",
@@ -130,6 +128,25 @@ export async function fetchBridgeSnapshot(config?: ClientConfig): Promise<Bridge
     pathRemote: devicePath(resolved, "/bootstrap"),
     timeoutMs: 2200
   });
+}
+
+export async function fetchSessions(config?: ClientConfig): Promise<AgentSession[]> {
+  const snapshot = await fetchSessionsSnapshot(config);
+  return snapshot?.sessions ?? [];
+}
+
+export async function fetchSessionEvents(config?: ClientConfig, sessionId?: string): Promise<SessionEvent[]> {
+  const snapshot = await fetchSessionsSnapshot(config);
+  const all = snapshot?.events ?? [];
+  if (!sessionId) return all;
+  return all.filter((event) => event.sessionId === sessionId);
+}
+
+export async function fetchSessionPendingInputs(config?: ClientConfig, sessionId?: string): Promise<PendingInput[]> {
+  const snapshot = await fetchSessionsSnapshot(config);
+  const all = snapshot?.pendingInputs ?? [];
+  if (!sessionId) return all;
+  return all.filter((pending) => pending.sessionId === sessionId);
 }
 
 export async function fetchDeviceStatus(config?: ClientConfig): Promise<RemoteDeviceStatus | null> {
@@ -228,6 +245,10 @@ export async function fetchWorkspaces(config?: ClientConfig): Promise<Workspace[
 }
 
 export async function fetchLauncherRuns(config?: ClientConfig): Promise<LauncherRun[]> {
+  return fetchSessionRuns(config);
+}
+
+export async function fetchSessionRuns(config?: ClientConfig, sessionId?: string): Promise<LauncherRun[]> {
   const resolved = resolveClientConfig(config);
   const data = await requestJson<{ ok: boolean; runs: LauncherRun[] }>(resolved, {
     method: "GET",
@@ -236,7 +257,28 @@ export async function fetchLauncherRuns(config?: ClientConfig): Promise<Launcher
     timeoutMs: 2200,
     bridgeAuth: true
   });
-  return data?.runs ?? [];
+  const runs = data?.runs ?? [];
+  if (!sessionId) return runs;
+  return runs.filter((run) => run.sessionId === sessionId);
+}
+
+export async function fetchSessionRun(
+  configOrRunId: ClientConfig | string,
+  maybeRunId?: string
+): Promise<LauncherRun | null> {
+  const config = maybeRunId ? resolveClientConfig(configOrRunId as ClientConfig) : resolveClientConfig(undefined);
+  const runId = safeTrim(maybeRunId ?? (configOrRunId as string));
+  if (!runId) return null;
+
+  const resolved = resolveClientConfig(config);
+  const data = await requestJson<{ ok: boolean; run: LauncherRun }>(resolved, {
+    method: "GET",
+    pathLocal: `/api/launcher/runs/${encodeURIComponent(runId)}`,
+    pathRemote: devicePath(resolved, `/launcher/runs/${encodeURIComponent(runId)}`),
+    timeoutMs: 2200,
+    bridgeAuth: true
+  });
+  return data?.run ?? null;
 }
 
 export async function launchTask(
@@ -256,6 +298,28 @@ export async function launchTask(
   });
 
   return data?.run ?? null;
+}
+
+export async function sendSessionMessage(
+  configOrInput: ClientConfig | SessionMessageInput,
+  maybeInput?: SessionMessageInput
+): Promise<{ ok: boolean; delivered: boolean } | null> {
+  const { config, input } = normalizeSessionMessageArgs(configOrInput, maybeInput);
+  const resolved = resolveClientConfig(config);
+  const sessionId = safeTrim(input.sessionId);
+  const text = safeTrim(input.text);
+  if (!sessionId || !text) return null;
+
+  const data = await requestJson<{ ok: boolean; delivered: boolean }>(resolved, {
+    method: "POST",
+    pathLocal: `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
+    pathRemote: devicePath(resolved, `/sessions/${encodeURIComponent(sessionId)}/messages`),
+    timeoutMs: 3200,
+    bridgeAuth: true,
+    body: { text }
+  });
+
+  return data ?? null;
 }
 
 export async function stopRun(configOrRunId: ClientConfig | string, maybeRunId?: string): Promise<boolean> {
@@ -418,6 +482,23 @@ function normalizeLaunchArgs(configOrInput: ClientConfig | LaunchInput, maybeInp
   return {
     config: DEFAULT_CLIENT_CONFIG,
     input: configOrInput as LaunchInput
+  };
+}
+
+function normalizeSessionMessageArgs(
+  configOrInput: ClientConfig | SessionMessageInput,
+  maybeInput?: SessionMessageInput
+) {
+  if (maybeInput) {
+    return {
+      config: configOrInput as ClientConfig,
+      input: maybeInput
+    };
+  }
+
+  return {
+    config: DEFAULT_CLIENT_CONFIG,
+    input: configOrInput as SessionMessageInput
   };
 }
 

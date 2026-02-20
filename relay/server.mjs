@@ -16,6 +16,11 @@ const RELAY_PORT = toInt(process.env.PORT || process.env.RELAY_PORT, 9797);
 const RELAY_PUBLIC_URL = trimTrailingSlash(
   process.env.RELAY_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${RELAY_PORT}`
 );
+const RELAY_WAKE_PROXY_URL = trimTrailingSlash(process.env.RELAY_WAKE_PROXY_URL || process.env.WAKE_PROXY_URL || "");
+const RELAY_WAKE_PROXY_TOKEN = safeText(process.env.RELAY_WAKE_PROXY_TOKEN || process.env.WAKE_PROXY_TOKEN || "", 500);
+const RELAY_WAKE_TIMEOUT_MS = clamp(toInt(process.env.RELAY_WAKE_TIMEOUT_MS, 90_000), 5_000, 5 * 60 * 1000);
+const RELAY_WAKE_POLL_INTERVAL_MS = clamp(toInt(process.env.RELAY_WAKE_POLL_INTERVAL_MS, 1200), 250, 10_000);
+const RELAY_WAKE_REQUEST_TIMEOUT_MS = clamp(toInt(process.env.RELAY_WAKE_REQUEST_TIMEOUT_MS, 6000), 1000, 60_000);
 const PAIRING_TTL_MS = clamp(toInt(process.env.PAIRING_TTL_MS, 10 * 60 * 1000), 30_000, 24 * 60 * 60 * 1000);
 const RPC_TIMEOUT_MS = clamp(toInt(process.env.RELAY_RPC_TIMEOUT_MS, 15_000), 500, 60_000);
 const CLEANUP_INTERVAL_MS = 30_000;
@@ -33,6 +38,7 @@ let shuttingDown = false;
 
 const laptopSockets = new Map();
 const pendingRpcs = new Map();
+const pendingWakeAttempts = new Map();
 
 app.use(cors());
 app.use(express.json({ limit: "2mb" }));
@@ -48,7 +54,8 @@ app.get("/health", (_req, res) => {
     onlineLaptops,
     totalLaptops: state.laptops.length,
     activePairings,
-    issuedPhoneTokens: state.phones.length
+    issuedPhoneTokens: state.phones.length,
+    wakeProxyEnabled: Boolean(RELAY_WAKE_PROXY_URL)
   });
 });
 
@@ -75,6 +82,9 @@ app.post("/api/laptops/register", (req, res) => {
   const laptopId = createId("lap");
   const laptopToken = createToken("ltkn");
   const deviceId = createId("dev");
+  const wakeMacAddress = normalizeMacAddress(
+    req.body?.wakeMac || req.body?.wake_mac || req.body?.macAddress || req.body?.wake?.macAddress
+  );
 
   const laptop = {
     laptopId,
@@ -91,7 +101,12 @@ app.post("/api/laptops/register", (req, res) => {
     lastConnectedAt: null,
     lastDisconnectedAt: null,
     lastSnapshotAt: null,
-    latestSnapshot: null
+    latestSnapshot: null,
+    wake: {
+      macAddress: wakeMacAddress || null
+    },
+    lastWakeRequestedAt: null,
+    lastWakeResult: null
   };
 
   mutateState(() => {
@@ -131,6 +146,12 @@ app.get("/api/laptops/me", (req, res) => {
     lastConnectedAt: laptop.lastConnectedAt,
     lastDisconnectedAt: laptop.lastDisconnectedAt,
     lastSnapshotAt: laptop.lastSnapshotAt,
+    wake: {
+      macAddress: laptop?.wake?.macAddress || null
+    },
+    wakeConfigured: Boolean(laptop?.wake?.macAddress),
+    lastWakeRequestedAt: laptop.lastWakeRequestedAt || null,
+    lastWakeResult: laptop.lastWakeResult || null,
     activePairing: activePairing
       ? {
           code: activePairing.code,
@@ -145,6 +166,19 @@ app.post("/api/laptops/pairing", (req, res) => {
   cleanupExpiredPairings();
   const laptop = req.laptopSession;
   const force = Boolean(req.body?.force);
+  const wakeMacAddress = normalizeMacAddress(
+    req.body?.wakeMac || req.body?.wake_mac || req.body?.macAddress || req.body?.wake?.macAddress
+  );
+
+  if (wakeMacAddress && wakeMacAddress !== laptop?.wake?.macAddress) {
+    mutateState(() => {
+      laptop.wake = {
+        ...(isObject(laptop.wake) ? laptop.wake : {}),
+        macAddress: wakeMacAddress
+      };
+      laptop.updatedAt = Date.now();
+    });
+  }
 
   const existingPairing =
     !force
@@ -249,17 +283,23 @@ app.use("/api/devices/:id", requirePhoneToken, requireDeviceAccess);
 
 app.get("/api/devices/:id/status", (req, res) => {
   const laptop = req.deviceLaptop;
+  const connected = isLaptopConnected(laptop.laptopId);
 
   return res.json({
     ok: true,
     deviceId: laptop.deviceId,
     laptopId: laptop.laptopId,
-    connected: isLaptopConnected(laptop.laptopId),
+    connected,
     pairedAt: laptop.pairedAt,
     lastConnectedAt: laptop.lastConnectedAt,
     lastDisconnectedAt: laptop.lastDisconnectedAt,
     latestSnapshotAt: laptop.lastSnapshotAt,
-    pairingExpiresAt: laptop.pairingExpiresAt
+    pairingExpiresAt: laptop.pairingExpiresAt,
+    wakeConfigured: Boolean(laptop?.wake?.macAddress),
+    wakeProxyEnabled: Boolean(RELAY_WAKE_PROXY_URL),
+    autoWakeCapable: Boolean(!connected && RELAY_WAKE_PROXY_URL && laptop?.wake?.macAddress),
+    lastWakeRequestedAt: laptop.lastWakeRequestedAt || null,
+    lastWakeResult: laptop.lastWakeResult || null
   });
 });
 
@@ -326,7 +366,9 @@ app.post("/api/devices/:id/launcher/start", async (req, res) => {
   return proxyToLaptopBridge(req, res, {
     method: "POST",
     path: "/api/launcher/start",
-    body: req.body || {}
+    body: req.body || {},
+    autoWake: true,
+    wakeIntent: "launch_run"
   });
 });
 
@@ -336,6 +378,44 @@ app.post("/api/devices/:id/launcher/runs/:runId/stop", async (req, res) => {
     method: "POST",
     path: `/api/launcher/runs/${runId}/stop`,
     body: req.body || {}
+  });
+});
+
+app.post("/api/devices/:id/sessions/:sessionId/messages", async (req, res) => {
+  const sessionId = encodeURIComponent(safeText(req.params.sessionId, 200));
+  if (!sessionId) {
+    return res.status(400).json({ ok: false, error: "sessionId is required" });
+  }
+
+  return proxyToLaptopBridge(req, res, {
+    method: "POST",
+    path: `/api/sessions/${sessionId}/messages`,
+    body: req.body || {},
+    autoWake: true,
+    wakeIntent: "send_message"
+  });
+});
+
+app.post("/api/devices/:id/wake", async (req, res) => {
+  const laptop = req.deviceLaptop;
+  const result = await ensureLaptopOnline(laptop, {
+    autoWake: true,
+    wakeIntent: "manual_wake",
+    timeoutMs: clamp(toInt(req.body?.timeoutMs, RELAY_WAKE_TIMEOUT_MS), 2_000, 5 * 60 * 1000)
+  });
+
+  if (!result.ok) {
+    return res.status(503).json({
+      ok: false,
+      error: result.error || "unable to wake device",
+      wakeAttempted: result.wakeAttempted
+    });
+  }
+
+  return res.json({
+    ok: true,
+    connected: isLaptopConnected(laptop.laptopId),
+    wakeAttempted: result.wakeAttempted
   });
 });
 
@@ -449,6 +529,18 @@ process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
 async function proxyToLaptopBridge(req, res, input) {
   const laptop = req.deviceLaptop;
+
+  const online = await ensureLaptopOnline(laptop, {
+    autoWake: Boolean(input?.autoWake),
+    wakeIntent: safeText(input?.wakeIntent, 80) || "proxy_request"
+  });
+  if (!online.ok) {
+    return res.status(503).json({
+      ok: false,
+      error: online.error || "laptop is not connected",
+      wakeAttempted: online.wakeAttempted
+    });
+  }
 
   try {
     const rpc = await sendLaptopRpc(laptop.laptopId, input);
@@ -626,6 +718,127 @@ async function sendLaptopRpc(laptopId, request, timeoutMs = RPC_TIMEOUT_MS) {
       reject(error);
     }
   });
+}
+
+async function ensureLaptopOnline(laptop, options = {}) {
+  if (!laptop) {
+    return { ok: false, error: "device not found", wakeAttempted: false };
+  }
+
+  if (isLaptopConnected(laptop.laptopId)) {
+    return { ok: true, wakeAttempted: false };
+  }
+
+  if (!options.autoWake) {
+    return { ok: false, error: "laptop is not connected", wakeAttempted: false };
+  }
+
+  const wakeResult = await triggerWakeAndWait(laptop, {
+    wakeIntent: options.wakeIntent,
+    timeoutMs: options.timeoutMs
+  });
+  if (wakeResult.ok) {
+    return { ok: true, wakeAttempted: true };
+  }
+
+  return {
+    ok: false,
+    error: wakeResult.error || "laptop is not connected",
+    wakeAttempted: true
+  };
+}
+
+async function triggerWakeAndWait(laptop, options = {}) {
+  const pending = pendingWakeAttempts.get(laptop.laptopId);
+  if (pending) return pending;
+
+  const attempt = (async () => {
+    const wakeMacAddress = normalizeMacAddress(laptop?.wake?.macAddress);
+    if (!RELAY_WAKE_PROXY_URL) {
+      return { ok: false, error: "wake proxy is not configured" };
+    }
+    if (!wakeMacAddress) {
+      return { ok: false, error: "wake MAC address is not configured for this laptop" };
+    }
+
+    mutateState(() => {
+      laptop.lastWakeRequestedAt = Date.now();
+      laptop.lastWakeResult = "requested";
+    });
+
+    const wakeProxyResponse = await callWakeProxy({
+      laptopId: laptop.laptopId,
+      deviceId: laptop.deviceId,
+      macAddress: wakeMacAddress,
+      intent: safeText(options?.wakeIntent, 80) || "auto_wake",
+      laptopName: safeText(laptop.name, 120) || null
+    });
+
+    if (!wakeProxyResponse.ok) {
+      mutateState(() => {
+        laptop.lastWakeResult = `failed:${wakeProxyResponse.error || "unknown"}`;
+      });
+      return { ok: false, error: wakeProxyResponse.error || "wake proxy request failed" };
+    }
+
+    const timeoutMs = clamp(toInt(options?.timeoutMs, RELAY_WAKE_TIMEOUT_MS), 2_000, 5 * 60 * 1000);
+    const deadline = Date.now() + timeoutMs;
+
+    while (Date.now() < deadline) {
+      if (isLaptopConnected(laptop.laptopId)) {
+        mutateState(() => {
+          laptop.lastWakeResult = "online";
+        });
+        return { ok: true };
+      }
+      await sleep(RELAY_WAKE_POLL_INTERVAL_MS);
+    }
+
+    mutateState(() => {
+      laptop.lastWakeResult = "timeout";
+    });
+    return { ok: false, error: "wake timed out; laptop did not reconnect" };
+  })()
+    .catch((error) => ({ ok: false, error: String(error?.message || error) }))
+    .finally(() => {
+      pendingWakeAttempts.delete(laptop.laptopId);
+    });
+
+  pendingWakeAttempts.set(laptop.laptopId, attempt);
+  return attempt;
+}
+
+async function callWakeProxy(payload) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RELAY_WAKE_REQUEST_TIMEOUT_MS);
+
+  try {
+    const headers = {
+      "Content-Type": "application/json",
+      Accept: "application/json"
+    };
+    if (RELAY_WAKE_PROXY_TOKEN) {
+      headers.Authorization = `Bearer ${RELAY_WAKE_PROXY_TOKEN}`;
+    }
+
+    const response = await fetch(`${RELAY_WAKE_PROXY_URL}/api/wake`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(payload),
+      signal: controller.signal
+    });
+
+    const body = await safeParseJsonResponse(response);
+    if (!response.ok) {
+      return { ok: false, error: safeText(body?.error, 240) || `wake proxy error (${response.status})` };
+    }
+
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error) };
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 function settlePendingRpc(laptopId, message) {
@@ -889,7 +1102,12 @@ function sanitizeState(raw) {
           lastConnectedAt: item.lastConnectedAt ? toInt(item.lastConnectedAt, null) : null,
           lastDisconnectedAt: item.lastDisconnectedAt ? toInt(item.lastDisconnectedAt, null) : null,
           lastSnapshotAt: item.lastSnapshotAt ? toInt(item.lastSnapshotAt, null) : null,
-          latestSnapshot: isObject(item.latestSnapshot) ? item.latestSnapshot : null
+          latestSnapshot: isObject(item.latestSnapshot) ? item.latestSnapshot : null,
+          wake: {
+            macAddress: normalizeMacAddress(item?.wake?.macAddress || item?.wakeMac || item?.macAddress) || null
+          },
+          lastWakeRequestedAt: item.lastWakeRequestedAt ? toInt(item.lastWakeRequestedAt, null) : null,
+          lastWakeResult: safeText(item.lastWakeResult, 120) || null
         }))
         .filter((item) => item.laptopId && item.deviceId && item.laptopToken)
     : [];
@@ -996,4 +1214,28 @@ function trimTrailingSlash(value) {
   const trimmed = String(value || "").trim();
   if (!trimmed) return "";
   return trimmed.replace(/\/+$/, "");
+}
+
+function normalizeMacAddress(value) {
+  const raw = String(value || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^0-9A-F]/g, "");
+  if (raw.length !== 12) return "";
+  const chunks = raw.match(/.{1,2}/g);
+  return chunks ? chunks.join(":") : "";
+}
+
+async function safeParseJsonResponse(response) {
+  try {
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
 }
