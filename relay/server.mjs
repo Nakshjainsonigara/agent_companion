@@ -1264,7 +1264,8 @@ function normalizePreviewTarget(targetUrlInput, portInput) {
   const host = String(parsed.hostname || "").toLowerCase();
   if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1" && host !== "0.0.0.0") return "";
 
-  const normalized = new URL(`${parsed.protocol}//${host === "0.0.0.0" ? "127.0.0.1" : host}`);
+  const normalizedHost = host === "localhost" || host === "::1" || host === "0.0.0.0" ? "127.0.0.1" : host;
+  const normalized = new URL(`${parsed.protocol}//${normalizedHost}`);
   if (parsed.port) {
     const port = toInt(parsed.port, 0);
     if (port <= 0 || port > 65535) return "";

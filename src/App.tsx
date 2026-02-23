@@ -616,7 +616,7 @@ function App() {
       }
 
       if (pairingConfig?.mode === "REMOTE") {
-        const previewWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
+        setToast("Opening preview...");
         void (async () => {
           try {
             const preview = await createPreview(clientConfig, {
@@ -625,25 +625,11 @@ function App() {
               expiresInSec: 2 * 60 * 60,
             });
             if (!preview?.publicUrl) {
-              try {
-                previewWindow?.close();
-              } catch {
-                // ignore
-              }
               setToast("Unable to create preview link");
               return;
             }
-            if (previewWindow) {
-              previewWindow.location.href = preview.publicUrl;
-            } else {
-              window.location.assign(preview.publicUrl);
-            }
+            window.location.assign(preview.publicUrl);
           } catch (error) {
-            try {
-              previewWindow?.close();
-            } catch {
-              // ignore
-            }
             if (error instanceof TokenExpiredError) {
               handleTokenExpired();
               return;
