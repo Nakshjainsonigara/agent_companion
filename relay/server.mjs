@@ -562,7 +562,7 @@ app.all(/^\/(?:preview|p)\/([^/]+)(?:\/(.*))?$/, (req, res) => {
 // Support assets requested via absolute root paths (e.g. /styles.css) from preview pages.
 // Many local dev servers emit root-absolute URLs, which would otherwise bypass /p/:token.
 app.all(/^\/(?!api(?:\/|$)|ws(?:\/|$)|pair(?:\/|$)|health$|preview(?:\/|$)|p(?:\/|$)).+/, (req, res, next) => {
-  const previewToken = extractPreviewTokenFromReferer(req);
+  const previewToken = extractPreviewTokenFromCookie(req) || extractPreviewTokenFromReferer(req);
   if (!previewToken) return next();
   return handlePreviewProxy(req, res, {
     forcedToken: previewToken,
@@ -720,6 +720,7 @@ async function handlePreviewProxy(req, res, options = {}) {
   if (!preview) {
     return res.status(404).type("text/plain").send("preview link expired or not found");
   }
+  setPreviewTokenCookie(res, accessToken, preview.expiresAt);
 
   const laptop = findLaptopById(preview.laptopId);
   if (!laptop) {
@@ -760,16 +761,95 @@ async function handlePreviewProxy(req, res, options = {}) {
       },
       PREVIEW_RPC_TIMEOUT_MS
     );
+    const rewrittenRpc = maybeRewritePreviewHtmlResponse(rpc, accessToken, preview.target);
 
     mutateState(() => {
       preview.lastAccessedAt = Date.now();
       preview.updatedAt = Date.now();
     });
 
-    return relayRpcResponse(res, rpc);
+    return relayRpcResponse(res, rewrittenRpc);
   } catch (error) {
     return res.status(resolveRpcErrorStatus(error)).type("text/plain").send(String(error?.message || error));
   }
+}
+
+function setPreviewTokenCookie(res, accessToken, expiresAt) {
+  const token = safeText(accessToken, 500);
+  if (!token) return;
+  const now = Date.now();
+  const maxAgeSec = Math.max(60, Math.floor((toInt(expiresAt, now + 60_000) - now) / 1000));
+  const cookie = `ac_preview_token=${encodeURIComponent(token)}; Path=/; Max-Age=${maxAgeSec}; SameSite=Lax`;
+  res.append("Set-Cookie", cookie);
+}
+
+function maybeRewritePreviewHtmlResponse(rpc, accessToken, previewTarget) {
+  if (!rpc || typeof rpc !== "object") return rpc;
+  if (safeText(rpc.bodyType, 20) !== "text") return rpc;
+  if (typeof rpc.body !== "string" || !rpc.body) return rpc;
+  if (!isHtmlResponse(rpc.responseHeaders, rpc.body)) return rpc;
+
+  const token = safeText(accessToken, 500);
+  if (!token) return rpc;
+
+  const prefix = `/p/${encodeURIComponent(token)}`;
+  let html = String(rpc.body);
+
+  // Prefix root-relative resource attributes so they keep preview token context.
+  html = html.replace(
+    /(\b(?:href|src|action|poster)\s*=\s*["'])\/(?!\/|p\/|preview\/)/gi,
+    `$1${prefix}/`
+  );
+
+  // Prefix CSS url('/...') references in inline style blocks.
+  html = html.replace(/url\((['"]?)\/(?!\/|p\/|preview\/)/gi, `url($1${prefix}/`);
+
+  // Rewrite absolute localhost URLs to preview-prefixed paths.
+  const origins = buildLocalhostOrigins(previewTarget);
+  for (const origin of origins) {
+    const escaped = escapeRegExp(origin);
+    html = html.replace(new RegExp(`${escaped}/`, "gi"), `${prefix}/`);
+  }
+
+  return {
+    ...rpc,
+    bodyType: "text",
+    body: html,
+    responseHeaders: {
+      ...(isObject(rpc.responseHeaders) ? rpc.responseHeaders : {}),
+      "content-type": "text/html; charset=utf-8"
+    }
+  };
+}
+
+function isHtmlResponse(headersInput, bodyText) {
+  const contentType = getHeaderCaseInsensitive(headersInput, "content-type");
+  if (contentType && /text\/html|application\/xhtml\+xml/i.test(contentType)) return true;
+  const sample = safeText(String(bodyText || "").slice(0, 300), 300).toLowerCase();
+  if (!sample) return false;
+  return sample.includes("<html") || sample.includes("<!doctype html");
+}
+
+function buildLocalhostOrigins(previewTarget) {
+  const target = safeText(previewTarget, 2000);
+  if (!target) return [];
+  try {
+    const parsed = new URL(target);
+    const protocol = parsed.protocol === "https:" ? "https" : "http";
+    const port = parsed.port ? `:${parsed.port}` : "";
+    const origins = new Set([
+      `${protocol}://127.0.0.1${port}`,
+      `${protocol}://localhost${port}`,
+      `${protocol}://[::1]${port}`
+    ]);
+    return [...origins];
+  } catch {
+    return [];
+  }
+}
+
+function escapeRegExp(value) {
+  return String(value || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function extractPreviewTokenFromReferer(req) {
@@ -784,6 +864,35 @@ function extractPreviewTokenFromReferer(req) {
   } catch {
     return "";
   }
+}
+
+function extractPreviewTokenFromCookie(req) {
+  const cookieHeader = safeText(req.header("cookie"), 8000);
+  if (!cookieHeader) return "";
+  const pairs = cookieHeader.split(";");
+  for (const pair of pairs) {
+    const [rawKey, ...rest] = pair.split("=");
+    if (!rawKey || rest.length === 0) continue;
+    const key = rawKey.trim();
+    if (key !== "ac_preview_token") continue;
+    try {
+      return safeText(decodeURIComponent(rest.join("=").trim()), 500);
+    } catch {
+      return safeText(rest.join("=").trim(), 500);
+    }
+  }
+  return "";
+}
+
+function getHeaderCaseInsensitive(headersInput, name) {
+  if (!isObject(headersInput)) return "";
+  const target = String(name || "").toLowerCase();
+  for (const [key, value] of Object.entries(headersInput)) {
+    if (String(key || "").toLowerCase() !== target) continue;
+    if (typeof value !== "string") continue;
+    return value;
+  }
+  return "";
 }
 
 function relayRpcResponse(res, rpc) {

@@ -2175,6 +2175,69 @@ function InlineCode({
 
 function renderInlineLinks(text: string, keyPrefix: string, onOpenLink?: (href: string) => void) {
   if (!text) return null;
+  const nodes: ReactNode[] = [];
+  const markdownLinkPattern =
+    /\[([^\]\n]+)\]\(((?:https?:\/\/|www\.|localhost:|127\.0\.0\.1:)[^\s<>"'`]+)\)/gi;
+
+  let lastIndex = 0;
+  let markdownMatch: RegExpExecArray | null = markdownLinkPattern.exec(text);
+  let index = 0;
+
+  while (markdownMatch) {
+    const start = markdownMatch.index;
+    const end = start + markdownMatch[0].length;
+    const label = markdownMatch[1];
+    const rawHref = markdownMatch[2];
+
+    if (start > lastIndex) {
+      nodes.push(...renderPlainUrlSegment(text.slice(lastIndex, start), `${keyPrefix}-mdtxt-${index}`, onOpenLink));
+    }
+
+    const cleanedHref = trimUrlPunctuation(rawHref);
+    if (cleanedHref) {
+      const href = toLinkHref(cleanedHref);
+      nodes.push(
+        <a
+          key={`${keyPrefix}-mdlink-${index}`}
+          href={href}
+          target="_blank"
+          rel="noreferrer noopener"
+          onClick={(event) => {
+            if (!onOpenLink) return;
+            event.preventDefault();
+            onOpenLink(href);
+          }}
+          className="underline decoration-dotted underline-offset-2 transition hover:text-brand-openai"
+        >
+          {label}
+        </a>
+      );
+    } else {
+      nodes.push(markdownMatch[0]);
+    }
+
+    index += 1;
+    lastIndex = end;
+    markdownMatch = markdownLinkPattern.exec(text);
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(...renderPlainUrlSegment(text.slice(lastIndex), `${keyPrefix}-tail`, onOpenLink));
+  }
+
+  return nodes;
+}
+
+function trimUrlPunctuation(value: string) {
+  return String(value || "")
+    .trim()
+    .replace(/^[(*_~`<\[]+/, "")
+    .replace(/[)>*_,.;!?~`\]]+$/g, "");
+}
+
+function renderPlainUrlSegment(text: string, keyPrefix: string, onOpenLink?: (href: string) => void): ReactNode[] {
+  if (!text) return [];
+
   const urlPattern = /\b(?:https?:\/\/|www\.|localhost:|127\.0\.0\.1:)[^\s<>"'`]+/gi;
   const nodes: ReactNode[] = [];
   let lastIndex = 0;
@@ -2228,10 +2291,6 @@ function renderInlineLinks(text: string, keyPrefix: string, onOpenLink?: (href: 
   }
 
   return nodes;
-}
-
-function trimUrlPunctuation(value: string) {
-  return String(value || "").replace(/[),.;!?]+$/g, "");
 }
 
 function toLinkHref(value: string) {
