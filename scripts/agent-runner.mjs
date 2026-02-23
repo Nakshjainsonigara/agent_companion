@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 
 const argv = process.argv.slice(2);
 const dividerIndex = argv.indexOf("--");
@@ -16,23 +17,33 @@ if (command.length === 0) {
 
 const options = parseOptions(optionArgs);
 const agentType = options.agent === "CLAUDE" ? "CLAUDE" : "CODEX";
+const bridgeUrl = options.bridge || process.env.AGENT_BRIDGE_URL || "http://localhost:8787";
+const sessionId = options.session || `${agentType.toLowerCase()}_${Date.now()}`;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const backgroundHelperPath = path.resolve(__dirname, "background-service.mjs");
 const launchOptions = {
   fullWorkspaceAccess: parseBooleanEnv(options.fullWorkspaceAccess, false),
   skipPermissions: parseBooleanEnv(options.skipPermissions, false),
   planMode: parseBooleanEnv(options.planMode, false)
 };
+const persistentServerHint = buildPersistentServerHint({
+  helperScriptPath: backgroundHelperPath,
+  bridgeUrl,
+  workspacePath: process.cwd(),
+  sessionId
+});
 normalizeCommand(command, {
   agentType,
   fullWorkspaceAccess: launchOptions.fullWorkspaceAccess,
   skipPermissions: launchOptions.skipPermissions,
-  planMode: launchOptions.planMode
+  planMode: launchOptions.planMode,
+  persistentServerHint
 });
 
-const sessionId = options.session || `${agentType.toLowerCase()}_${Date.now()}`;
 const title = options.title || command.join(" ").slice(0, 120);
 const repo = options.repo || path.basename(process.cwd());
 const branch = options.branch || detectBranch();
-const bridgeUrl = options.bridge || process.env.AGENT_BRIDGE_URL || "http://localhost:8787";
 
 const usage = {
   promptTokens: safeInt(options.promptTokens, 0),
@@ -61,9 +72,17 @@ const ENABLE_CODEX_RESUME_PROMOTION = parseBooleanEnv(
 );
 const ENABLE_CODEX_THREAD_INDEX = parseBooleanEnv(process.env.AGENT_ENABLE_CODEX_THREAD_INDEX, true);
 
+const childEnv = {
+  ...process.env,
+  AGENT_COMPANION_BACKGROUND_HELPER: backgroundHelperPath,
+  AGENT_COMPANION_BRIDGE_URL: bridgeUrl,
+  AGENT_SESSION_ID: sessionId,
+  AGENT_WORKSPACE_PATH: process.cwd()
+};
+
 const child = spawn(command[0], command.slice(1), {
   cwd: process.cwd(),
-  env: process.env,
+  env: childEnv,
   stdio: ["pipe", "pipe", "pipe"]
 });
 
@@ -528,9 +547,10 @@ function normalizeCommand(commandArgs, options = {}) {
   const fullWorkspaceAccess = Boolean(options.fullWorkspaceAccess);
   const skipPermissions = Boolean(options.skipPermissions);
   const planMode = Boolean(options.planMode);
+  const persistentServerHint = String(options.persistentServerHint || "").trim();
 
   if (commandArgs[0] === "claude") {
-    normalizeClaudeCommand(commandArgs, { fullWorkspaceAccess, skipPermissions, planMode });
+    normalizeClaudeCommand(commandArgs, { fullWorkspaceAccess, skipPermissions, planMode, persistentServerHint });
     return;
   }
 
@@ -617,6 +637,14 @@ function normalizeCommand(commandArgs, options = {}) {
       );
     }
   }
+
+  if (persistentServerHint) {
+    const promptIndex = findCodexPromptIndex(commandArgs);
+    if (promptIndex >= 0) {
+      commandArgs[promptIndex] = appendPromptHint(commandArgs[promptIndex], persistentServerHint);
+      console.log("[agent-runner] appended managed-server runtime hint to Codex prompt");
+    }
+  }
 }
 
 function normalizeClaudeCommand(commandArgs, options = {}) {
@@ -669,6 +697,84 @@ function normalizeClaudeCommand(commandArgs, options = {}) {
       console.log("[agent-runner] enabled `--output-format stream-json` for Claude session tracking");
     }
   }
+
+  const persistentServerHint = String(options.persistentServerHint || "").trim();
+  if (persistentServerHint) {
+    const promptIndex = findClaudePromptIndex(commandArgs);
+    if (promptIndex >= 0) {
+      commandArgs[promptIndex] = appendPromptHint(commandArgs[promptIndex], persistentServerHint);
+      console.log("[agent-runner] appended managed-server runtime hint to Claude prompt");
+    }
+  }
+}
+
+function findCodexPromptIndex(commandArgs) {
+  if (!Array.isArray(commandArgs) || commandArgs[0] !== "codex" || commandArgs[1] !== "exec") {
+    return -1;
+  }
+
+  const resumeIndex = commandArgs.findIndex((part, index) => index >= 2 && part === "resume");
+  if (resumeIndex >= 0) {
+    const promptIndex = resumeIndex + 2;
+    if (promptIndex < commandArgs.length) {
+      return promptIndex;
+    }
+    return -1;
+  }
+
+  for (let index = commandArgs.length - 1; index >= 2; index -= 1) {
+    const token = String(commandArgs[index] || "");
+    if (!token) continue;
+    if (token.startsWith("-")) continue;
+    return index;
+  }
+
+  return -1;
+}
+
+function findClaudePromptIndex(commandArgs) {
+  if (!Array.isArray(commandArgs) || commandArgs[0] !== "claude") return -1;
+  for (let index = 0; index < commandArgs.length; index += 1) {
+    if (commandArgs[index] === "-p" || commandArgs[index] === "--print") {
+      if (index + 1 < commandArgs.length) {
+        return index + 1;
+      }
+      return -1;
+    }
+  }
+  return -1;
+}
+
+function appendPromptHint(prompt, hint) {
+  const cleanedPrompt = String(prompt || "").trim();
+  if (!cleanedPrompt) return cleanedPrompt;
+
+  const marker = "AGENT_COMPANION_PERSIST_SERVER_HINT_V1";
+  if (cleanedPrompt.includes(marker)) {
+    return cleanedPrompt;
+  }
+
+  return `${cleanedPrompt}\n\n${hint}`;
+}
+
+function buildPersistentServerHint(input = {}) {
+  const helperScriptPath = String(input.helperScriptPath || "").trim();
+  const bridgeUrl = String(input.bridgeUrl || "http://localhost:8787").trim();
+  const workspacePath = String(input.workspacePath || "").trim();
+  const sessionId = String(input.sessionId || "").trim();
+  if (!helperScriptPath) return "";
+
+  const escapedHelper = helperScriptPath.replace(/"/g, '\\"');
+  const escapedBridge = bridgeUrl.replace(/"/g, '\\"');
+  const escapedWorkspace = workspacePath.replace(/"/g, '\\"');
+  const escapedSession = sessionId.replace(/"/g, '\\"');
+
+  return (
+    "AGENT_COMPANION_PERSIST_SERVER_HINT_V1:\n" +
+    "If you need a localhost server to stay alive after this response, do NOT use nohup/setsid/&.\n" +
+    `Use this exact pattern:\nnode "${escapedHelper}" --bridge "${escapedBridge}" --workspace "${escapedWorkspace}" --session "${escapedSession}" --label "dev-server" --port <PORT> -- <server command>\n` +
+    "Then continue with normal progress updates."
+  );
 }
 
 function removeFlagWithValue(args, longFlag, shortFlag) {

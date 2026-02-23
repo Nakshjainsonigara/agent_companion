@@ -383,6 +383,14 @@ app.get("/api/devices/:id/launcher/runs", async (req, res) => {
   });
 });
 
+app.get("/api/devices/:id/launcher/services", async (req, res) => {
+  const pathWithQuery = withQuery("/api/launcher/services", req.query);
+  return proxyToLaptopBridge(req, res, {
+    method: "GET",
+    path: pathWithQuery
+  });
+});
+
 app.post("/api/devices/:id/launcher/start", async (req, res) => {
   return proxyToLaptopBridge(req, res, {
     method: "POST",
@@ -398,6 +406,25 @@ app.post("/api/devices/:id/launcher/runs/:runId/stop", async (req, res) => {
   return proxyToLaptopBridge(req, res, {
     method: "POST",
     path: `/api/launcher/runs/${runId}/stop`,
+    body: req.body || {}
+  });
+});
+
+app.post("/api/devices/:id/launcher/services/start", async (req, res) => {
+  return proxyToLaptopBridge(req, res, {
+    method: "POST",
+    path: "/api/launcher/services/start",
+    body: req.body || {},
+    autoWake: true,
+    wakeIntent: "start_background_service"
+  });
+});
+
+app.post("/api/devices/:id/launcher/services/:serviceId/stop", async (req, res) => {
+  const serviceId = encodeURIComponent(String(req.params.serviceId || ""));
+  return proxyToLaptopBridge(req, res, {
+    method: "POST",
+    path: `/api/launcher/services/${serviceId}/stop`,
     body: req.body || {}
   });
 });

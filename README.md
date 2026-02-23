@@ -89,6 +89,9 @@ Phone-side API contract (with `Authorization: Bearer <phoneToken>`):
 - `GET /api/devices/:id/launcher/runs`
 - `POST /api/devices/:id/launcher/start`
 - `POST /api/devices/:id/launcher/runs/:runId/stop`
+- `GET /api/devices/:id/launcher/services`
+- `POST /api/devices/:id/launcher/services/start`
+- `POST /api/devices/:id/launcher/services/:serviceId/stop`
 - `GET /api/devices/:id/previews`
 - `POST /api/devices/:id/previews`
 - `DELETE /api/devices/:id/previews/:previewId`
@@ -129,6 +132,31 @@ Notes:
 - Target must be local-only (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`) for safety.
 - Preview links are temporary (TTL).
 - Laptop still needs internet + relay connection (sleep/offline handled via wake flow if configured).
+
+### Keep localhost servers alive after agent run exits
+Some agent shells clean detached processes when a one-shot run ends.  
+Use the managed background service command so preview URLs keep working:
+
+```bash
+cd /Users/nakshjain/Desktop/agent
+npm run background:start -- \
+  --workspace "/absolute/workspace/path" \
+  --session "<optional-session-id>" \
+  --label "dev-server" \
+  --port 5173 \
+  -- npm run dev -- --host 127.0.0.1 --port 5173
+```
+
+List/stop managed services:
+
+```bash
+curl http://localhost:8787/api/launcher/services
+curl -X POST http://localhost:8787/api/launcher/services/<serviceId>/stop \
+  -H "Content-Type: application/json" \
+  -d '{"signal":"SIGTERM"}'
+```
+
+Agent runs now receive a runtime hint to use this helper whenever they need a persistent localhost server.
 
 ## 0.25) Auto-wake for sleeping laptops
 To wake a sleeping laptop automatically before a run/message, deploy the wake proxy on an always-on device in the same LAN as the laptop (small VM, mini-PC, NAS, router host, etc).

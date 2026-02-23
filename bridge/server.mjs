@@ -20,6 +20,8 @@ const MAX_LAUNCHER_RUN_OUTPUT_LINES = 80;
 const MAX_LAUNCHER_RUNS = 150;
 const MAX_CHAT_TURNS = 4000;
 const MAX_TRANSCRIPT_SEGMENTS_PER_RUN = 220;
+const MAX_MANAGED_SERVICES = 120;
+const MAX_MANAGED_SERVICE_OUTPUT_LINES = 180;
 
 const app = express();
 app.use(cors());
@@ -27,6 +29,7 @@ app.use(express.json({ limit: "1mb" }));
 
 let state = loadState();
 const launcherRuns = new Map();
+const managedServices = new Map();
 
 function loadState() {
   try {
@@ -1427,6 +1430,290 @@ function serializeRun(run) {
   };
 }
 
+function trimManagedServices() {
+  if (managedServices.size <= MAX_MANAGED_SERVICES) return;
+  const entries = [...managedServices.entries()].sort((a, b) => safeNumber(b[1]?.createdAt, 0) - safeNumber(a[1]?.createdAt, 0));
+  const keep = new Set(entries.slice(0, MAX_MANAGED_SERVICES).map(([id]) => id));
+  for (const [id, service] of managedServices.entries()) {
+    if (keep.has(id)) continue;
+    if (service?.status === "RUNNING" || service?.status === "STARTING") {
+      continue;
+    }
+    managedServices.delete(id);
+  }
+}
+
+function parseCommandInput(input) {
+  if (Array.isArray(input)) {
+    const parts = input
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+    return parts.length > 0 ? parts : null;
+  }
+
+  const value = safeTrimmedText(input, 5000);
+  if (!value) return null;
+  return ["/bin/zsh", "-lc", value];
+}
+
+function appendManagedServiceOutput(service, text) {
+  if (!service || !text) return;
+  const lines = String(text)
+    .split(/\r?\n/)
+    .map((line) => stripAnsi(line).trim())
+    .filter(Boolean);
+  if (lines.length === 0) return;
+  service.outputTail.push(...lines);
+  if (service.outputTail.length > MAX_MANAGED_SERVICE_OUTPUT_LINES) {
+    service.outputTail = service.outputTail.slice(-MAX_MANAGED_SERVICE_OUTPUT_LINES);
+  }
+  service.lastOutputAt = Date.now();
+}
+
+function isPidRunning(pid) {
+  const numericPid = safeInt(pid, 0);
+  if (numericPid <= 0) return false;
+  try {
+    process.kill(numericPid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function refreshManagedServiceRuntime(service) {
+  if (!service) return;
+  if (service.status !== "RUNNING" && service.status !== "STARTING") return;
+  if (!isPidRunning(service.pid)) {
+    service.status = service.stopRequested ? "STOPPED" : "FAILED";
+    service.endedAt = service.endedAt || Date.now();
+    service.error = service.error || "process is no longer running";
+  }
+}
+
+function serializeManagedService(service) {
+  refreshManagedServiceRuntime(service);
+  return {
+    id: service.id,
+    sessionId: service.sessionId || null,
+    workspacePath: service.workspacePath,
+    label: service.label,
+    command: service.command,
+    status: service.status,
+    createdAt: service.createdAt,
+    startedAt: service.startedAt,
+    endedAt: service.endedAt,
+    pid: service.pid,
+    exitCode: service.exitCode,
+    signal: service.signal,
+    error: service.error,
+    port: service.port,
+    localhostUrl: service.localhostUrl,
+    stopRequested: Boolean(service.stopRequested),
+    lastOutputAt: service.lastOutputAt || null,
+    outputTail: Array.isArray(service.outputTail) ? service.outputTail.slice(-MAX_MANAGED_SERVICE_OUTPUT_LINES) : []
+  };
+}
+
+function startManagedService(input) {
+  const workspacePath = normalizeWorkspacePath(input?.workspacePath);
+  if (!workspacePath) {
+    return { statusCode: 400, error: "workspacePath must point to an existing local directory" };
+  }
+  if (!isWorkspaceAllowed(workspacePath)) {
+    return {
+      statusCode: 403,
+      error: "workspacePath is outside allowed roots",
+      allowedRoots: WORKSPACE_ROOTS
+    };
+  }
+
+  const command = parseCommandInput(input?.command);
+  if (!command || command.length === 0) {
+    return { statusCode: 400, error: "command is required" };
+  }
+
+  const sessionId = safeTrimmedText(input?.sessionId, 180) || null;
+  const serviceId = `svc_${Date.now()}_${Math.floor(Math.random() * 10_000)}`;
+  const label =
+    safeTrimmedText(input?.label, 140) ||
+    safeTrimmedText(command.join(" "), 140) ||
+    "Background service";
+  const portRaw = safeInt(input?.port, 0);
+  const port = portRaw > 0 && portRaw <= 65535 ? portRaw : null;
+  const localhostUrl = port ? `http://localhost:${port}` : null;
+
+  const envInput = input?.env && typeof input.env === "object" ? input.env : {};
+  const env = { ...process.env };
+  for (const [key, value] of Object.entries(envInput)) {
+    const envKey = safeTrimmedText(key, 120);
+    if (!envKey || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(envKey)) continue;
+    if (typeof value !== "string") continue;
+    env[envKey] = value;
+  }
+
+  const service = {
+    id: serviceId,
+    sessionId,
+    workspacePath,
+    label,
+    command,
+    status: "STARTING",
+    createdAt: Date.now(),
+    startedAt: null,
+    endedAt: null,
+    pid: null,
+    exitCode: null,
+    signal: null,
+    error: null,
+    stopRequested: false,
+    port,
+    localhostUrl,
+    outputTail: [],
+    lastOutputAt: null,
+    child: null
+  };
+
+  managedServices.set(serviceId, service);
+  trimManagedServices();
+
+  try {
+    const child = spawn(command[0], command.slice(1), {
+      cwd: workspacePath,
+      env,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    child.unref();
+    service.child = child;
+
+    child.on("spawn", () => {
+      service.status = "RUNNING";
+      service.startedAt = Date.now();
+      service.pid = child.pid ?? null;
+      if (sessionId) {
+        withPersist(() => {
+          addEvent({
+            sessionId,
+            summary: `Background service started: ${label}${localhostUrl ? ` (${localhostUrl})` : ""}`,
+            category: "ACTION",
+            timestamp: Date.now()
+          });
+        });
+      }
+    });
+
+    child.stdout.on("data", (chunk) => {
+      appendManagedServiceOutput(service, chunk.toString());
+    });
+    child.stderr.on("data", (chunk) => {
+      appendManagedServiceOutput(service, chunk.toString());
+    });
+
+    child.on("error", (error) => {
+      service.status = "FAILED";
+      service.error = String(error?.message || error);
+      service.endedAt = Date.now();
+      if (sessionId) {
+        withPersist(() => {
+          addEvent({
+            sessionId,
+            summary: `Background service failed to start: ${service.error}`,
+            category: "ERROR",
+            timestamp: Date.now()
+          });
+        });
+      }
+    });
+
+    child.on("close", (code, signal) => {
+      service.exitCode = Number.isInteger(code) ? code : null;
+      service.signal = signal ?? null;
+      service.endedAt = Date.now();
+      service.child = null;
+      if (service.stopRequested) {
+        service.status = "STOPPED";
+      } else {
+        service.status = service.exitCode === 0 ? "COMPLETED" : "FAILED";
+      }
+      if (sessionId) {
+        withPersist(() => {
+          addEvent({
+            sessionId,
+            summary:
+              service.status === "COMPLETED"
+                ? `Background service completed: ${label}`
+                : service.status === "STOPPED"
+                  ? `Background service stopped: ${label}`
+                  : `Background service exited: ${label}${service.exitCode != null ? ` (code ${service.exitCode})` : ""}`,
+            category: service.status === "FAILED" ? "ERROR" : "INFO",
+            timestamp: Date.now()
+          });
+        });
+      }
+    });
+  } catch (error) {
+    service.status = "FAILED";
+    service.error = String(error?.message || error);
+    service.endedAt = Date.now();
+    return { statusCode: 500, error: service.error, service };
+  }
+
+  return { statusCode: 201, service };
+}
+
+function stopManagedService(service, signalInput) {
+  if (!service) {
+    return { statusCode: 404, error: "service not found" };
+  }
+
+  const signal = safeTrimmedText(signalInput, 24) || "SIGTERM";
+  service.stopRequested = true;
+
+  const pid = safeInt(service.pid, 0);
+  let stopped = false;
+  try {
+    if (pid > 0) {
+      process.kill(pid, signal);
+      stopped = true;
+    }
+  } catch {
+    stopped = false;
+  }
+
+  if (!stopped && service.child) {
+    try {
+      service.child.kill(signal);
+      stopped = true;
+    } catch {
+      stopped = false;
+    }
+  }
+
+  if (!stopped) {
+    refreshManagedServiceRuntime(service);
+    if (service.status === "RUNNING" || service.status === "STARTING") {
+      return { statusCode: 409, error: "unable to stop process" };
+    }
+  }
+
+  service.status = "STOPPED";
+  service.endedAt = Date.now();
+
+  if (service.sessionId) {
+    withPersist(() => {
+      addEvent({
+        sessionId: service.sessionId,
+        summary: `Background service stop requested (${signal}): ${service.label}`,
+        category: "ACTION",
+        timestamp: Date.now()
+      });
+    });
+  }
+
+  return { statusCode: 200, service };
+}
+
 function mergeDirectSnapshot(snapshot) {
   if (!snapshot || typeof snapshot !== "object") return;
 
@@ -1658,7 +1945,11 @@ function applyPendingAction(input) {
 
 app.get("/health", (_req, res) => {
   const activeRuns = [...launcherRuns.values()].filter((run) => run.status === "RUNNING").length;
-  res.json({ ok: true, service: "agent-bridge", activeRuns });
+  const activeServices = [...managedServices.values()].filter((service) => {
+    refreshManagedServiceRuntime(service);
+    return service.status === "RUNNING" || service.status === "STARTING";
+  }).length;
+  res.json({ ok: true, service: "agent-bridge", activeRuns, activeServices });
 });
 
 app.get("/api/bootstrap", (_req, res) => {
@@ -1887,6 +2178,33 @@ app.get("/api/launcher/runs", (_req, res) => {
   return res.json({ ok: true, runs });
 });
 
+app.get("/api/launcher/services", (_req, res) => {
+  const services = [...managedServices.values()]
+    .map((service) => serializeManagedService(service))
+    .sort((a, b) => safeNumber(b.createdAt, 0) - safeNumber(a.createdAt, 0));
+
+  return res.json({ ok: true, services });
+});
+
+app.post("/api/launcher/services/start", (req, res) => {
+  const started = startManagedService(req.body || {});
+  if (!started.service) {
+    return res.status(started.statusCode || 400).json({
+      ok: false,
+      error: started.error || "unable to start background service",
+      details: started
+    });
+  }
+
+  return res.status(started.statusCode || 201).json({
+    ok: true,
+    service: serializeManagedService(started.service),
+    hint: started.service.localhostUrl
+      ? `Service started. Open ${started.service.localhostUrl} (or use relay preview from phone).`
+      : "Service started."
+  });
+});
+
 app.get("/api/launcher/runs/:runId", (req, res) => {
   const run = launcherRuns.get(req.params.runId);
   if (!run) {
@@ -1941,6 +2259,22 @@ app.post("/api/launcher/runs/:runId/stop", (req, res) => {
   return res.json({ ok: true, run: serializeRun(run) });
 });
 
+app.post("/api/launcher/services/:serviceId/stop", (req, res) => {
+  const service = managedServices.get(req.params.serviceId);
+  const stopped = stopManagedService(service, req.body?.signal);
+  if (!stopped.service) {
+    return res.status(stopped.statusCode || 400).json({
+      ok: false,
+      error: stopped.error || "unable to stop service"
+    });
+  }
+
+  return res.status(stopped.statusCode || 200).json({
+    ok: true,
+    service: serializeManagedService(stopped.service)
+  });
+});
+
 app.post("/api/settings/update", (req, res) => {
   const payload = req.body && typeof req.body === "object" ? req.body : {};
   const wantsWorkspaceRoot = Object.prototype.hasOwnProperty.call(payload, "workspaceRoot");
@@ -1986,6 +2320,21 @@ app.post("/api/reset", (_req, res) => {
     }
   }
   launcherRuns.clear();
+
+  for (const service of managedServices.values()) {
+    service.stopRequested = true;
+    const pid = safeInt(service.pid, 0);
+    try {
+      if (pid > 0) {
+        process.kill(pid, "SIGTERM");
+      } else if (service.child) {
+        service.child.kill("SIGTERM");
+      }
+    } catch {
+      // ignore stop errors during reset
+    }
+  }
+  managedServices.clear();
 
   withPersist(() => {
     state = buildDefaultState();

@@ -22,6 +22,8 @@ if (command === "laptop") {
   runNodeScript(path.resolve(projectRoot, "relay", "server.mjs"), rest);
 } else if (command === "bridge") {
   runNodeScript(path.resolve(projectRoot, "bridge", "server.mjs"), rest);
+} else if (command === "background" || command === "bg") {
+  runNodeScript(path.resolve(projectRoot, "scripts", "background-service.mjs"), rest);
 } else if (command === "wake-proxy") {
   runNodeScript(path.resolve(projectRoot, "wake-proxy", "server.mjs"), rest);
 } else {
@@ -52,12 +54,14 @@ function printHelp(exitCode) {
   agent-companion laptop --with-local-relay
   agent-companion relay
   agent-companion bridge
+  agent-companion background --workspace <path> -- <command>
   agent-companion wake-proxy
 
 Examples:
   agent-companion laptop
   agent-companion laptop --relay https://agent-companion-relay.onrender.com
   agent-companion laptop --with-local-relay
+  agent-companion background --workspace ~/Desktop/test --port 5173 -- npm run dev
   agent-companion wake-proxy
 `);
   process.exit(exitCode);

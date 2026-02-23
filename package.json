@@ -14,6 +14,7 @@
     "ui:claude": "claude --resume 9f359518-cae4-4da8-9e55-0ac7e261e85a",
     "ui:delegate": "node scripts/ui-claude-delegate.mjs",
     "run:agent": "node scripts/agent-runner.mjs",
+    "background:start": "node scripts/background-service.mjs",
     "resume:repair": "node scripts/repair-codex-resume.mjs",
     "task:start": "node scripts/start-task.mjs",
     "pending:add": "node scripts/add-pending.mjs",
