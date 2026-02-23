@@ -1110,6 +1110,7 @@ function App() {
   }
 
   const laptopOnline = isRemote ? Boolean(deviceStatus?.online) : bridgeConnected;
+  const showBottomNav = !(activeTab === "SESSIONS" && showSessionDetail);
   const lastSeenText =
     isRemote && deviceStatus?.lastSeenAt
       ? Date.now() - deviceStatus.lastSeenAt < 60_000
@@ -1119,7 +1120,12 @@ function App() {
 
   return (
     <div className="relative min-h-screen bg-background text-foreground">
-      <div className="mx-auto w-full max-w-lg px-5 pb-28 pt-[max(env(safe-area-inset-top),16px)]">
+      <div
+        className={cn(
+          "mx-auto w-full max-w-lg px-5 pt-[max(env(safe-area-inset-top),16px)]",
+          showBottomNav ? "pb-28" : "pb-4"
+        )}
+      >
         <header className="flex items-center justify-between pb-4">
           <div className="flex items-baseline gap-0">
             <span className="font-space text-base font-bold tracking-tight text-brand-claude">agent</span>
@@ -1728,7 +1734,7 @@ function App() {
             ) : !selectedSession ? (
               <EmptyState message="Session not found." />
             ) : (
-              <div className="font-mono -mb-28 flex flex-col" style={{ minHeight: "calc(100vh - 80px)" }}>
+              <div className="font-mono flex flex-col" style={{ minHeight: "calc(100dvh - 80px)" }}>
                 {/* TUI header bar — fixed */}
                 <div className="-mx-5 shrink-0 border-b border-white/[0.06] bg-background px-5 pb-2">
                   <button
@@ -1946,42 +1952,49 @@ function App() {
         )}
       </div>
 
-      <nav className="fixed inset-x-0 bottom-0 z-20 pb-[max(env(safe-area-inset-bottom),6px)]">
-        <div className="mx-auto flex w-[calc(100%-32px)] max-w-md items-center justify-around rounded-2xl border border-white/[0.06] bg-background/80 py-1.5 backdrop-blur-xl">
-          {TAB_ITEMS.map((item) => {
-            const Icon = item.icon;
-            const active = activeTab === item.id;
-            const hasPending = item.id === "ACTIONS" && pendingInputs.length > 0;
-            const hasRunning = item.id === "RUN" && hasActiveRuns;
+      {showBottomNav && (
+        <nav className="fixed inset-x-0 bottom-0 z-20 pb-[max(env(safe-area-inset-bottom),6px)]">
+          <div className="mx-auto flex w-[calc(100%-32px)] max-w-md items-center justify-around rounded-2xl border border-white/[0.06] bg-background/80 py-1.5 backdrop-blur-xl">
+            {TAB_ITEMS.map((item) => {
+              const Icon = item.icon;
+              const active = activeTab === item.id;
+              const hasPending = item.id === "ACTIONS" && pendingInputs.length > 0;
+              const hasRunning = item.id === "RUN" && hasActiveRuns;
 
-            return (
-              <button
-                key={item.id}
-                onClick={() => {
-                  setActiveTab(item.id);
-                  if (item.id === "SESSIONS") {
-                    setShowSessionDetail(false);
-                  }
-                }}
-                className={cn(
-                  "relative flex flex-col items-center gap-0.5 px-2 py-1.5 transition",
-                  active ? "text-foreground" : "text-muted-foreground/40"
-                )}
-              >
-                <div className="relative">
-                  <Icon className={cn("h-[17px] w-[17px]", active && "text-brand-claude")} />
-                  {hasPending && <span className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
-                  {hasRunning && <span className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />}
-                </div>
-                <span className={cn("text-[9px]", active ? "text-foreground/70" : "text-muted-foreground/30")}>{item.label}</span>
-              </button>
-            );
-          })}
-        </div>
-      </nav>
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => {
+                    setActiveTab(item.id);
+                    if (item.id === "SESSIONS") {
+                      setShowSessionDetail(false);
+                    }
+                  }}
+                  className={cn(
+                    "relative flex flex-col items-center gap-0.5 px-2 py-1.5 transition",
+                    active ? "text-foreground" : "text-muted-foreground/40"
+                  )}
+                >
+                  <div className="relative">
+                    <Icon className={cn("h-[17px] w-[17px]", active && "text-brand-claude")} />
+                    {hasPending && <span className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 rounded-full bg-amber-400" />}
+                    {hasRunning && <span className="absolute -right-1.5 -top-0.5 h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-400" />}
+                  </div>
+                  <span className={cn("text-[9px]", active ? "text-foreground/70" : "text-muted-foreground/30")}>{item.label}</span>
+                </button>
+              );
+            })}
+          </div>
+        </nav>
+      )}
 
       {toast && (
-        <div className="fixed bottom-20 left-1/2 z-30 -translate-x-1/2 animate-fade-in rounded-full border border-white/[0.06] bg-surface px-4 py-2 text-xs text-foreground backdrop-blur-lg">
+        <div
+          className={cn(
+            "fixed left-1/2 z-30 -translate-x-1/2 animate-fade-in rounded-full border border-white/[0.06] bg-surface px-4 py-2 text-xs text-foreground backdrop-blur-lg",
+            showBottomNav ? "bottom-20" : "bottom-6"
+          )}
+        >
           {toast}
         </div>
       )}
