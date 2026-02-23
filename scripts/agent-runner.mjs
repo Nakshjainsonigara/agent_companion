@@ -50,6 +50,7 @@ let lastPendingAt = 0;
 let lastUpsertAt = 0;
 let done = false;
 let codexThreadId = "";
+let claudeSessionId = "";
 let codexRolloutPromoted = false;
 let codexPromotionNoticeShown = false;
 const CODEX_GLOBAL_STATE_FILE = path.join(os.homedir(), ".codex", ".codex-global-state.json");
@@ -85,9 +86,15 @@ child.stderr.on("data", (chunk) => {
 
 // Forward remote action replies (phone approvals/replies) to the running CLI command.
 process.stdin.on("data", (chunk) => {
+  if (agentType !== "CODEX") return;
   if (!child.stdin || child.stdin.destroyed || !child.stdin.writable) return;
   child.stdin.write(chunk);
 });
+
+if (agentType !== "CODEX" && child.stdin && !child.stdin.destroyed && child.stdin.writable) {
+  // Claude print-mode can wait on open stdin; close it to force prompt-argument execution.
+  child.stdin.end();
+}
 
 process.on("SIGINT", () => {
   child.kill("SIGINT");
@@ -189,17 +196,26 @@ child.on("close", async (code) => {
     });
   }
 
+  if (claudeSessionId) {
+    await safePost("/api/events/add", {
+      sessionId,
+      summary: `Resume later: claude --resume ${claudeSessionId}`,
+      category: "INFO",
+      timestamp: Date.now()
+    });
+  }
+
   process.exit(exitCode);
 });
 
 function handleOutputLine(line) {
-  if (tryHandleCodexJsonLine(line)) return;
+  if (tryHandleStructuredJsonLine(line)) return;
   parseTokenSignals(line);
   maybeEmitInputRequest(line);
   maybeEmitMilestoneEvent(line);
 }
 
-function tryHandleCodexJsonLine(line) {
+function tryHandleStructuredJsonLine(line) {
   const trimmed = line.trim();
   if (!trimmed || trimmed[0] !== "{") return false;
 
@@ -211,6 +227,20 @@ function tryHandleCodexJsonLine(line) {
   }
 
   if (!payload || typeof payload !== "object") return true;
+
+  const payloadSessionId = normalizeUuid(payload.session_id);
+  if (payloadSessionId) {
+    if (!claudeSessionId) {
+      claudeSessionId = payloadSessionId;
+      console.log(`[agent-runner] claude_session=${claudeSessionId}`);
+      void safePost("/api/events/add", {
+        sessionId,
+        summary: `Claude session ready: ${claudeSessionId} (resume: claude --resume ${claudeSessionId})`,
+        category: "INFO",
+        timestamp: Date.now()
+      });
+    }
+  }
 
   if (payload.type === "thread.started" && typeof payload.thread_id === "string") {
     const threadId = payload.thread_id.trim();
@@ -256,6 +286,30 @@ function tryHandleCodexJsonLine(line) {
         maybeEmitInputRequest(message);
         maybeEmitMilestoneEvent(message);
       }
+    }
+    return true;
+  }
+
+  if (payload.type === "assistant" && payload.message && typeof payload.message === "object") {
+    const message = payload.message;
+    const assistantText = extractStructuredText(message.content || message.text);
+    if (assistantText) {
+      maybeEmitInputRequest(assistantText);
+      maybeEmitMilestoneEvent(assistantText);
+    }
+    applyUsageFromRecord(message.usage);
+    return true;
+  }
+
+  if (payload.type === "result") {
+    const resultText = typeof payload.result === "string" ? payload.result.trim() : "";
+    if (resultText) {
+      maybeEmitInputRequest(resultText);
+      maybeEmitMilestoneEvent(resultText);
+    }
+    applyUsageFromRecord(payload.usage);
+    if (typeof payload.total_cost_usd === "number" && Number.isFinite(payload.total_cost_usd)) {
+      usage.costUsd = Number(payload.total_cost_usd.toFixed(4));
     }
     return true;
   }
@@ -314,6 +368,67 @@ function maybeEmitInputRequest(line) {
     lastUpdated: Date.now(),
     tokenUsage: usage
   });
+}
+
+function applyUsageFromRecord(record) {
+  if (!record || typeof record !== "object") return;
+
+  const promptTokens =
+    safeInt(record.input_tokens, 0) +
+    safeInt(record.cached_input_tokens, 0) +
+    safeInt(record.cache_read_input_tokens, 0) +
+    safeInt(record.cache_creation_input_tokens, 0);
+  const completionTokens = safeInt(record.output_tokens, 0);
+
+  if (promptTokens > 0) {
+    usage.promptTokens = promptTokens;
+  }
+  if (completionTokens > 0) {
+    usage.completionTokens = completionTokens;
+  }
+  if (promptTokens > 0 || completionTokens > 0) {
+    usage.totalTokens = usage.promptTokens + usage.completionTokens;
+    if (usage.costUsd === 0 && usage.totalTokens > 0) {
+      usage.costUsd = Number((usage.totalTokens * 0.00001).toFixed(2));
+    }
+  }
+}
+
+function extractStructuredText(value) {
+  if (typeof value === "string") {
+    return value.trim();
+  }
+
+  if (Array.isArray(value)) {
+    const parts = value
+      .flatMap((item) => {
+        if (typeof item === "string") return [item.trim()];
+        if (!item || typeof item !== "object") return [];
+        if (typeof item.text === "string") return [item.text.trim()];
+        if (typeof item.message === "string") return [item.message.trim()];
+        if (typeof item.content === "string") return [item.content.trim()];
+        return [];
+      })
+      .filter(Boolean);
+    return parts.join("\n").trim();
+  }
+
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string") return value.text.trim();
+    if (typeof value.message === "string") return value.message.trim();
+    if (typeof value.content === "string") return value.content.trim();
+  }
+
+  return "";
+}
+
+function normalizeUuid(value) {
+  const candidate = String(value || "").trim().toLowerCase();
+  if (!candidate) return "";
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(candidate)) {
+    return "";
+  }
+  return candidate;
 }
 
 function parseTokenSignals(line) {
@@ -529,6 +644,30 @@ function normalizeClaudeCommand(commandArgs, options = {}) {
   ) {
     commandArgs.splice(1, 0, "--permission-mode", "plan");
     console.log("[agent-runner] enabled Claude plan mode (`--permission-mode plan`)");
+  }
+
+  const usesPrintMode = commandArgs.includes("-p") || commandArgs.includes("--print");
+  if (usesPrintMode) {
+    if (!commandArgs.includes("--verbose")) {
+      commandArgs.splice(1, 0, "--verbose");
+      console.log("[agent-runner] enabled `--verbose` for Claude stream-json output");
+    }
+
+    const outputFormatIndex = commandArgs.findIndex((part) => part === "--output-format");
+    if (outputFormatIndex >= 0) {
+      const current = String(commandArgs[outputFormatIndex + 1] || "").trim().toLowerCase();
+      if (current !== "stream-json") {
+        if (outputFormatIndex + 1 < commandArgs.length && !String(commandArgs[outputFormatIndex + 1]).startsWith("-")) {
+          commandArgs[outputFormatIndex + 1] = "stream-json";
+        } else {
+          commandArgs.splice(outputFormatIndex + 1, 0, "stream-json");
+        }
+        console.log("[agent-runner] forced Claude output to `--output-format stream-json` for session tracking");
+      }
+    } else {
+      commandArgs.splice(1, 0, "--output-format", "stream-json");
+      console.log("[agent-runner] enabled `--output-format stream-json` for Claude session tracking");
+    }
   }
 }
 

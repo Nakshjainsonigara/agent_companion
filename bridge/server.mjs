@@ -577,6 +577,9 @@ function findActiveRunForSession(sessionId) {
 
 function writeToRunStdin(run, message) {
   const target = run;
+  if (!target || target.agentType !== "CODEX") {
+    return false;
+  }
   if (
     !target?.child ||
     !target.child.stdin ||
@@ -959,6 +962,7 @@ function createLauncherRun(input) {
     signal: null,
     error: null,
     codexThreadId: null,
+    claudeSessionId: null,
     resumeCommand: null,
     stopRequested: false,
     assistantOutputSegments: [],
@@ -1255,6 +1259,18 @@ function extractTextFromContent(content) {
 function extractAssistantSegmentsFromJson(payload) {
   if (!payload || typeof payload !== "object") return [];
 
+  if (payload.type === "assistant") {
+    const message = payload.message && typeof payload.message === "object" ? payload.message : null;
+    if (message && message.role === "assistant") {
+      return extractTextFromContent(message.content || message.text);
+    }
+    return [];
+  }
+
+  if (payload.type === "result" && typeof payload.result === "string") {
+    return extractTextFromContent(payload.result);
+  }
+
   if (payload.type === "item.completed" && payload.item && typeof payload.item === "object") {
     if (payload.item.type === "agent_message") {
       return extractTextFromContent(payload.item.text || payload.item.content);
@@ -1340,6 +1356,15 @@ function appendRunOutput(run, text) {
       run.resumeCommand = `codex exec resume ${threadMatch[1]}`;
     }
 
+    const parsedLine = tryParseJsonLine(line);
+    if (parsedLine && typeof parsedLine === "object") {
+      const claudeSessionId = safeTrimmedText(parsedLine.session_id, 120);
+      if (claudeSessionId) {
+        run.claudeSessionId = claudeSessionId;
+        run.resumeCommand = `claude --resume ${claudeSessionId}`;
+      }
+    }
+
     const segments = collectAssistantSegmentsFromLine(rawLine);
     if (segments.length > 0) {
       if (!Array.isArray(run.assistantOutputSegments)) {
@@ -1394,7 +1419,9 @@ function serializeRun(run) {
     signal: run.signal,
     error: run.error,
     codexThreadId: run.codexThreadId ?? null,
+    claudeSessionId: run.claudeSessionId ?? null,
     resumeCommand: run.resumeCommand ?? null,
+    assistantFinalOutput: deriveAssistantFinalOutput(run) || null,
     stopRequested: run.stopRequested,
     outputTail: run.outputTail
   };

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   CheckCircle2,
@@ -252,12 +252,20 @@ function App() {
       }
 
       setBridgeConnected(true);
-      setSessions(snapshot.sessions);
-      setPendingInputs(snapshot.pendingInputs);
-      setEvents(snapshot.events);
-      setChatTurns((previous) => mergeChatTurnsFromSnapshot(snapshot.chatTurns ?? [], previous, Date.now()));
+      setSessions((previous) => (areSessionsEquivalent(previous, snapshot.sessions) ? previous : snapshot.sessions));
+      setPendingInputs((previous) =>
+        arePendingInputsEquivalent(previous, snapshot.pendingInputs) ? previous : snapshot.pendingInputs
+      );
+      setEvents((previous) => (areEventsEquivalent(previous, snapshot.events) ? previous : snapshot.events));
+      setChatTurns((previous) => {
+        const merged = mergeChatTurnsFromSnapshot(snapshot.chatTurns ?? [], previous, Date.now());
+        return areChatTurnsEquivalent(previous, merged) ? previous : merged;
+      });
       if (snapshot.settings) {
-        setSettingsPrefs((previous) => ({ ...previous, ...snapshot.settings }));
+        setSettingsPrefs((previous) => {
+          const merged = { ...previous, ...snapshot.settings };
+          return areSettingsEquivalent(previous, merged) ? previous : merged;
+        });
         if (snapshot.settings.workspaceRoot) {
           setWorkspaceRootDraft((previous) => previous || snapshot.settings.workspaceRoot);
         }
@@ -275,7 +283,7 @@ function App() {
     if (!pairingConfig) return;
     try {
       const runs = await fetchSessionRuns(clientConfig);
-      setLauncherRuns(runs);
+      setLauncherRuns((previous) => (areRunsEquivalent(previous, runs) ? previous : runs));
     } catch (error) {
       if (error instanceof TokenExpiredError) {
         handleTokenExpired();
@@ -501,21 +509,35 @@ function App() {
   const selectedSessionEvents = selectedSession ? eventsBySession.get(selectedSession.id) ?? [] : [];
   const selectedSessionPending = selectedSession ? pendingBySession.get(selectedSession.id) ?? null : null;
 
-  const buildCodexResumeCommand = useCallback(
+  const buildSessionContinueCommand = useCallback(
     (sessionId: string, prompt: string) => {
       const session = sessionById.get(sessionId);
-      if (!session || session.agentType !== "CODEX") return undefined;
+      if (!session) return undefined;
 
       const runs = runsBySession.get(sessionId) ?? [];
       const latestRun = runs.length > 0 ? runs[runs.length - 1] : null;
-      const fromRun = latestRun ? getCodexThreadId(latestRun) : "";
-      const fromSessionId = session.id.startsWith("codex:")
-        ? session.id.slice("codex:".length).trim().toLowerCase()
-        : "";
-      const threadId = fromRun || fromSessionId;
-      if (!threadId) return undefined;
 
-      return ["codex", "exec", "resume", threadId, prompt];
+      if (session.agentType === "CODEX") {
+        const fromRun = latestRun ? getCodexThreadId(latestRun) : "";
+        const fromSessionId = session.id.startsWith("codex:")
+          ? session.id.slice("codex:".length).trim().toLowerCase()
+          : "";
+        const threadId = fromRun || fromSessionId;
+        if (!threadId) return undefined;
+
+        return ["codex", "exec", "resume", threadId, prompt];
+      }
+
+      const fromRun = latestRun ? getClaudeSessionId(latestRun) : "";
+      const fromSessionId = session.id.startsWith("claude:")
+        ? normalizeClaudeSessionId(session.id.slice("claude:".length))
+        : "";
+      const claudeSessionId = fromRun || fromSessionId;
+      if (claudeSessionId) {
+        return ["claude", "--resume", claudeSessionId, "-p", prompt, "--output-format", "stream-json"];
+      }
+
+      return ["claude", "--continue", "-p", prompt, "--output-format", "stream-json"];
     },
     [sessionById, runsBySession]
   );
@@ -777,7 +799,7 @@ function App() {
           agentType: runAgentType,
           workspacePath: runWorkspace.path,
           prompt: launchPrompt,
-          command: shouldReuse && targetSessionId ? buildCodexResumeCommand(targetSessionId, launchPrompt) : undefined,
+          command: shouldReuse && targetSessionId ? buildSessionContinueCommand(targetSessionId, launchPrompt) : undefined,
           title: runTitle.trim() || undefined,
           sessionId: shouldReuse ? targetSessionId : undefined,
           newThread: !shouldReuse || undefined,
@@ -876,25 +898,26 @@ function App() {
           .slice()
           .reverse()
           .find((run) => run.status === "STARTING" || run.status === "RUNNING");
+        const canSendToActiveRun = Boolean(activeRun && selectedSession.agentType === "CODEX");
+        let fallbackReason: "NONE" | "NOT_DELIVERED" | "SEND_FAILED" = "NONE";
 
-        if (activeRun) {
-          const sent = await sendSessionMessage(clientConfig, {
-            sessionId: selectedSession.id,
-            text: draft,
-          });
+        if (canSendToActiveRun) {
+          try {
+            const sent = await sendSessionMessage(clientConfig, {
+              sessionId: selectedSession.id,
+              text: draft,
+            });
 
-          setIsSendingFollowUp(false);
-
-          if (!sent?.ok) {
-            setChatTurns((prev) => prev.filter((turn) => turn.id !== optimisticTurnId));
-            setSessionComposerDraft(draft);
-            setToast("Unable to send follow-up");
-            return;
+            if (sent?.ok && sent.delivered) {
+              setIsSendingFollowUp(false);
+              void refreshSnapshot();
+              setToast("Follow-up sent");
+              return;
+            }
+            fallbackReason = "NOT_DELIVERED";
+          } catch {
+            fallbackReason = "SEND_FAILED";
           }
-
-          void refreshSnapshot();
-          setToast(sent.delivered ? "Follow-up sent" : "Follow-up queued");
-          return;
         }
 
         const run = await launchTask(clientConfig, {
@@ -903,7 +926,7 @@ function App() {
           sessionId: selectedSession.id,
           title: selectedSession.title,
           prompt: draft,
-          command: buildCodexResumeCommand(selectedSession.id, draft),
+          command: buildSessionContinueCommand(selectedSession.id, draft),
           fullWorkspaceAccess: followUpContext.fullWorkspaceAccess,
           planMode: false,
         });
@@ -928,7 +951,15 @@ function App() {
 
         void refreshRuns();
         void refreshSnapshot();
-        setToast("Follow-up sent");
+        if (!canSendToActiveRun) {
+          setToast("Follow-up sent");
+        } else if (fallbackReason === "SEND_FAILED") {
+          setToast("Follow-up resumed in new run");
+        } else if (fallbackReason === "NOT_DELIVERED") {
+          setToast("Follow-up resumed in new run");
+        } else {
+          setToast("Follow-up sent");
+        }
       } catch (error) {
         setIsSendingFollowUp(false);
         setChatTurns((prev) => prev.filter((turn) => turn.id !== optimisticTurnId));
@@ -1619,9 +1650,9 @@ function App() {
             ) : !selectedSession ? (
               <EmptyState message="Session not found." />
             ) : (
-              <div className="font-mono">
-                {/* TUI header bar */}
-                <div className="sticky top-0 z-10 -mx-5 border-b border-white/[0.06] bg-background/95 px-5 pb-2 backdrop-blur-xl">
+              <div className="font-mono -mb-28 flex flex-col" style={{ minHeight: "calc(100vh - 80px)" }}>
+                {/* TUI header bar — fixed */}
+                <div className="-mx-5 shrink-0 border-b border-white/[0.06] bg-background px-5 pb-2">
                   <button
                     onClick={() => setShowSessionDetail(false)}
                     className="text-[11px] text-muted-foreground/60 transition hover:text-foreground"
@@ -1657,83 +1688,85 @@ function App() {
                   </div>
                 </div>
 
-                {/* TUI conversation feed */}
-                <div className="mt-3 space-y-0">
-                  {conversationRows.length === 0 ? (
-                    <div className="py-12 text-center">
-                      <p className="text-[12px] text-muted-foreground/30">~ no output ~</p>
-                      <p className="mt-1 text-[11px] text-muted-foreground/20">send a message to begin</p>
-                    </div>
-                  ) : (
-                    conversationRows.map((row, index) => {
-                      const prev = index > 0 ? conversationRows[index - 1] : null;
-                      const kindChanged = !prev || prev.kind !== row.kind;
-                      return (
-                        <ConversationRowView
-                          key={row.id}
-                          row={row}
-                          agentType={selectedSession.agentType}
-                          showRole={kindChanged}
-                        />
-                      );
-                    })
-                  )}
+                {/* TUI conversation feed — scrollable */}
+                <div className="-mx-5 flex-1 overflow-y-auto px-5 pt-3">
+                  <div className="space-y-0">
+                    {conversationRows.length === 0 ? (
+                      <div className="py-12 text-center">
+                        <p className="text-[12px] text-muted-foreground/30">~ no output ~</p>
+                        <p className="mt-1 text-[11px] text-muted-foreground/20">send a message to begin</p>
+                      </div>
+                    ) : (
+                      conversationRows.map((row, index) => {
+                        const prev = index > 0 ? conversationRows[index - 1] : null;
+                        const kindChanged = !prev || prev.kind !== row.kind;
+                        return (
+                          <ConversationRowView
+                            key={row.id}
+                            row={row}
+                            agentType={selectedSession.agentType}
+                            showRole={kindChanged}
+                          />
+                        );
+                      })
+                    )}
 
-                  {/* Blinking cursor when agent is running */}
-                  {selectedSession.state === "RUNNING" && (
-                    <div className="flex items-center gap-2 py-1">
-                      <span
-                        className={cn(
-                          "text-[11px]",
-                          selectedSession.agentType === "CODEX" ? "text-brand-openai/60" : "text-brand-claude/60"
+                    {/* Stable thinking indicator when agent is running */}
+                    {selectedSession.state === "RUNNING" && (
+                      <div className="mt-2 flex items-center gap-2 py-1">
+                        <span
+                          className={cn(
+                            "text-[11px]",
+                            selectedSession.agentType === "CODEX" ? "text-brand-openai/50" : "text-brand-claude/50"
+                          )}
+                        >
+                          ●
+                        </span>
+                        <span className="text-[11px] text-muted-foreground/40">Thinking…</span>
+                      </div>
+                    )}
+
+                    {/* Approval block — TUI style */}
+                    {selectedSessionPending && (
+                      <div className="mt-3 border-l-2 border-amber-400/40 pl-3 py-2">
+                        <p className="text-[10px] text-amber-400/70">
+                          ⚠ approval required · {formatRelativeTime(selectedSessionPending.requestedAt)}
+                        </p>
+                        <p className="mt-1 text-[12px] leading-snug text-foreground/80">{selectedSessionPending.prompt}</p>
+
+                        <div className="mt-2 flex gap-2">
+                          <button
+                            disabled={busyActionIds.includes(selectedSessionPending.id) || selectedSessionPending.actionable === false}
+                            onClick={() => handleAction(selectedSessionPending, "APPROVE")}
+                            className="rounded border border-emerald-400/30 bg-emerald-400/[0.06] px-3 py-1 text-[11px] text-emerald-400 transition hover:bg-emerald-400/[0.12] disabled:opacity-30"
+                          >
+                            [y] approve
+                          </button>
+                          <button
+                            disabled={busyActionIds.includes(selectedSessionPending.id) || selectedSessionPending.actionable === false}
+                            onClick={() => handleAction(selectedSessionPending, "REJECT")}
+                            className="rounded border border-rose-400/30 bg-rose-400/[0.06] px-3 py-1 text-[11px] text-rose-400 transition hover:bg-rose-400/[0.12] disabled:opacity-30"
+                          >
+                            [n] reject
+                          </button>
+                        </div>
+
+                        {selectedSessionPending.actionable === false && (
+                          <p className="mt-1.5 text-[10px] text-amber-400/50">read-only from phone</p>
                         )}
-                      >
-                        ●
-                      </span>
-                      <span className="animate-pulse text-[12px] text-foreground/50">▍</span>
-                    </div>
-                  )}
+                      </div>
+                    )}
 
-                  <div ref={conversationEndRef} />
+                    <div ref={conversationEndRef} className="h-4" />
+                  </div>
                 </div>
 
-                {/* Approval block — TUI style */}
-                {selectedSessionPending && (
-                  <div className="mt-3 border-l-2 border-amber-400/40 pl-3 py-2">
-                    <p className="text-[10px] text-amber-400/70">
-                      ⚠ approval required · {formatRelativeTime(selectedSessionPending.requestedAt)}
-                    </p>
-                    <p className="mt-1 text-[12px] leading-snug text-foreground/80">{selectedSessionPending.prompt}</p>
-
-                    <div className="mt-2 flex gap-2">
-                      <button
-                        disabled={busyActionIds.includes(selectedSessionPending.id) || selectedSessionPending.actionable === false}
-                        onClick={() => handleAction(selectedSessionPending, "APPROVE")}
-                        className="rounded border border-emerald-400/30 bg-emerald-400/[0.06] px-3 py-1 text-[11px] text-emerald-400 transition hover:bg-emerald-400/[0.12] disabled:opacity-30"
-                      >
-                        [y] approve
-                      </button>
-                      <button
-                        disabled={busyActionIds.includes(selectedSessionPending.id) || selectedSessionPending.actionable === false}
-                        onClick={() => handleAction(selectedSessionPending, "REJECT")}
-                        className="rounded border border-rose-400/30 bg-rose-400/[0.06] px-3 py-1 text-[11px] text-rose-400 transition hover:bg-rose-400/[0.12] disabled:opacity-30"
-                      >
-                        [n] reject
-                      </button>
-                    </div>
-
-                    {selectedSessionPending.actionable === false && (
-                      <p className="mt-1.5 text-[10px] text-amber-400/50">read-only from phone</p>
-                    )}
-                  </div>
-                )}
-
-                {/* TUI prompt-line composer */}
-                <div className="mt-4 border-t border-white/[0.06] pt-3">
+                {/* TUI prompt-line composer — pinned to bottom */}
+                <div className="-mx-5 shrink-0 border-t border-white/[0.06] bg-background px-5 pb-2 pt-2">
                   <div className="flex items-end gap-0">
                     <span
                       className={cn(
-                        "shrink-0 pb-2 pr-2 text-[13px] font-bold",
+                        "shrink-0 pb-1.5 pr-2 text-[13px] font-bold",
                         followUpContext
                           ? selectedSession.agentType === "CODEX" ? "text-brand-openai" : "text-brand-claude"
                           : "text-muted-foreground/20"
@@ -1769,7 +1802,7 @@ function App() {
                     )}
                   </div>
                   {followUpContext && (
-                    <p className="mt-1 text-[10px] text-muted-foreground/25">
+                    <p className="text-[10px] text-muted-foreground/25">
                       {followUpContext.workspacePath.split("/").pop()} · enter to send · shift+enter for newline
                     </p>
                   )}
@@ -2007,17 +2040,107 @@ function InlineCode({ text }: { text: string }) {
   const parts = text.split(/(`[^`]+`)/g);
   return (
     <>
-      {parts.map((part, i) =>
-        part.startsWith("`") && part.endsWith("`") ? (
-          <span key={i} className="rounded bg-white/[0.06] px-1 py-0.5 text-[11px] text-brand-claude/80">
-            {part.slice(1, -1)}
-          </span>
-        ) : (
-          <span key={i}>{part}</span>
-        )
-      )}
+      {parts.map((part, i) => {
+        if (part.startsWith("`") && part.endsWith("`")) {
+          const codeText = part.slice(1, -1);
+          const href = getHrefIfLinkLike(codeText);
+          if (href) {
+            return (
+              <a
+                key={i}
+                href={href}
+                target="_blank"
+                rel="noreferrer noopener"
+                className="inline-block cursor-pointer rounded bg-white/[0.06] px-1 py-0.5 text-[11px] text-brand-openai/90 underline decoration-dotted underline-offset-2 transition hover:text-brand-openai pointer-events-auto"
+              >
+                {codeText}
+              </a>
+            );
+          }
+          return (
+            <span key={i} className="rounded bg-white/[0.06] px-1 py-0.5 text-[11px] text-brand-claude/80">
+              {codeText}
+            </span>
+          );
+        }
+
+        return <span key={i}>{renderInlineLinks(part, `txt-${i}`)}</span>;
+      })}
     </>
   );
+}
+
+function renderInlineLinks(text: string, keyPrefix: string) {
+  if (!text) return null;
+  const urlPattern = /\b(?:https?:\/\/|www\.|localhost:|127\.0\.0\.1:)[^\s<>"'`]+/gi;
+  const nodes: ReactNode[] = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null = urlPattern.exec(text);
+  let index = 0;
+
+  while (match) {
+    const rawMatch = match[0];
+    const start = match.index;
+    const end = start + rawMatch.length;
+
+    if (start > lastIndex) {
+      nodes.push(text.slice(lastIndex, start));
+    }
+
+    const cleaned = trimUrlPunctuation(rawMatch);
+    const trailing = rawMatch.slice(cleaned.length);
+    if (cleaned) {
+      const href = toLinkHref(cleaned);
+      nodes.push(
+        <a
+          key={`${keyPrefix}-link-${index}`}
+          href={href}
+          target="_blank"
+          rel="noreferrer noopener"
+          className="underline decoration-dotted underline-offset-2 transition hover:text-brand-openai"
+        >
+          {cleaned}
+        </a>
+      );
+      index += 1;
+    } else {
+      nodes.push(rawMatch);
+    }
+
+    if (trailing) {
+      nodes.push(trailing);
+    }
+
+    lastIndex = end;
+    match = urlPattern.exec(text);
+  }
+
+  if (lastIndex < text.length) {
+    nodes.push(text.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
+function trimUrlPunctuation(value: string) {
+  return String(value || "").replace(/[),.;!?]+$/g, "");
+}
+
+function toLinkHref(value: string) {
+  const raw = value.trim();
+  if (raw.startsWith("http://") || raw.startsWith("https://")) return raw;
+  if (raw.startsWith("www.")) return `https://${raw}`;
+  if (raw.startsWith("localhost:") || raw.startsWith("127.0.0.1:")) return `http://${raw}`;
+  return raw;
+}
+
+function getHrefIfLinkLike(value: string) {
+  const cleaned = trimUrlPunctuation(value);
+  if (!cleaned) return "";
+  if (/^(https?:\/\/|www\.|localhost:|127\.0\.0\.1:)/i.test(cleaned)) {
+    return toLinkHref(cleaned);
+  }
+  return "";
 }
 
 function AssistantContentBlocks({ blocks, isFinal }: { blocks: ContentBlock[]; isFinal: boolean }) {
@@ -2157,7 +2280,7 @@ function RunCard({
 
   const title = run.title || run.prompt.slice(0, 80);
   const updatedAt = getRunUpdatedAt(run);
-  const runTranscript = extractRunTranscript(run.outputTail);
+  const runTranscript = getRunAssistantOutput(run);
   const preview = truncateText(runTranscript, 180);
 
   return (
@@ -2316,19 +2439,29 @@ function buildConversationRows(runs: LauncherRun[], turns: ChatTurn[], events: S
 
   if (turns.length > 0) {
     for (const turn of turns) {
-      const text = cleanOutputText(turn.text);
-      if (!text) continue;
+      const rawText = cleanOutputText(turn.text);
+      if (!rawText) continue;
 
       if (turn.role === "ASSISTANT") {
+        // Strip transient thinking/tool fragments line-by-line
+        const stableLines = rawText
+          .split("\n")
+          .filter((l) => !shouldHideRawOutput(l))
+          .join("\n")
+          .trim();
+        if (!stableLines) continue;
+
         rows.push({
           id: turn.id,
           kind: "assistant",
-          text,
+          text: stableLines,
           timestamp: turn.createdAt,
           turnKind: turn.kind,
         });
         continue;
       }
+
+      const text = rawText;
 
       if (turn.kind === "APPROVAL_ACTION") {
         rows.push({
@@ -2354,13 +2487,31 @@ function buildConversationRows(runs: LauncherRun[], turns: ChatTurn[], events: S
       .reverse()
       .find((run) => run.status === "STARTING" || run.status === "RUNNING");
     if (activeRun) {
-      const liveTranscript = extractRunTranscript(activeRun.outputTail);
+      const rawLiveTranscript = getRunAssistantOutput(activeRun);
+      // Strip transient fragments from live transcript too
+      const liveTranscript = rawLiveTranscript
+        ? rawLiveTranscript
+            .split("\n")
+            .filter((l) => !shouldHideRawOutput(l))
+            .join("\n")
+            .trim()
+        : "";
+      const previousAssistant = [...rows]
+        .slice()
+        .reverse()
+        .find((row) => row.kind === "assistant");
       if (liveTranscript) {
+        const liveNorm = normalizeMessageComparable(liveTranscript);
+        const prevNorm = previousAssistant ? normalizeMessageComparable(previousAssistant.text) : "";
+        // Skip if live text matches or is a subset of latest turn (avoids flicker/swap)
+        if (prevNorm && (liveNorm === prevNorm || prevNorm.includes(liveNorm))) {
+          return dedupeConversationRows(rows.sort((a, b) => a.timestamp - b.timestamp));
+        }
         rows.push({
           id: `${activeRun.id}:live`,
           kind: "assistant",
           text: liveTranscript,
-          timestamp: Date.now(),
+          timestamp: getRunUpdatedAt(activeRun),
           turnKind: "MESSAGE",
         });
       }
@@ -2380,7 +2531,7 @@ function buildConversationRows(runs: LauncherRun[], turns: ChatTurn[], events: S
       });
     }
 
-    const assistantOutput = extractRunTranscript(run.outputTail);
+    const assistantOutput = getRunAssistantOutput(run);
     if (assistantOutput) {
       rows.push({
         id: `${run.id}:assistant`,
@@ -2431,7 +2582,7 @@ function extractSessionPreview(turns: ChatTurn[], runs: LauncherRun[], events: S
 
   if (runs.length > 0) {
     const latestRun = runs[runs.length - 1];
-    const output = extractRunTranscript(latestRun.outputTail);
+    const output = getRunAssistantOutput(latestRun);
     if (output) return truncateText(output, 120);
     if (latestRun.prompt) return truncateText(cleanOutputText(latestRun.prompt), 120);
   }
@@ -2442,6 +2593,12 @@ function extractSessionPreview(turns: ChatTurn[], runs: LauncherRun[], events: S
 
 function getRunUpdatedAt(run: LauncherRun) {
   return run.endedAt ?? run.startedAt ?? run.createdAt;
+}
+
+function getRunAssistantOutput(run: LauncherRun) {
+  const stable = cleanOutputText(String(run.assistantFinalOutput || ""));
+  if (stable) return stable;
+  return extractRunTranscript(run.outputTail);
 }
 
 function resolveFollowUpContext(
@@ -2555,6 +2712,7 @@ function extractRunTranscript(outputTail: string[]) {
     if (parsed) {
       const parts = extractTranscriptSegmentsFromJson(parsed);
       for (const part of parts) {
+        if (shouldHideRawOutput(part)) continue;
         pushUnique(part);
       }
       continue;
@@ -2585,6 +2743,17 @@ function extractTranscriptSegmentsFromJson(payload: unknown): string[] {
   const event = payload as Record<string, unknown>;
   const type = typeof event.type === "string" ? event.type : "";
   const result: string[] = [];
+
+  if (type === "assistant") {
+    const message = asRecord(event.message);
+    if (!message) return [];
+    if (safeInlineText(message.role) !== "assistant") return [];
+    return extractTextFragments(message.content ?? message.text, 0);
+  }
+
+  if (type === "result") {
+    return extractTextFragments(event.result, 0);
+  }
 
   if (type === "item.completed") {
     const item = asRecord(event.item);
@@ -2671,12 +2840,17 @@ function shouldHideRawOutput(line: string) {
   if (!line) return true;
 
   if (line.startsWith("[agent-runner]")) return true;
+  // Hide transient thinking / tool-call fragments
+  if (/^\[thinking\]/i.test(line)) return true;
+  if (/^\[tool\]/i.test(line)) return true;
   if (/^\d{4}-\d{2}-\d{2}T/.test(line) && /\b(INFO|WARN|ERROR)\b/.test(line)) return true;
   if (/^(tip:|usage:|for more information, try|warning: term is set)/i.test(line)) return true;
   if (/^prompt[_\s-]*tokens?/i.test(line)) return true;
   if (/^completion[_\s-]*tokens?/i.test(line)) return true;
   if (/^total[_\s-]*tokens?/i.test(line)) return true;
   if (/^cost(?:[_\s-]*usd)?/i.test(line)) return true;
+  if (/\b\d[\d,]*(?:\.\d+)?\s*tok(?:en)?s?\b/i.test(line)) return true;
+  if (/^\$[\d,.]+/.test(line)) return true;
   if (/^error:\s*$/i.test(line)) return true;
   if (line === "y" || line === "n") return true;
 
@@ -2703,9 +2877,7 @@ function extractTextFragments(value: unknown, depth: number): string[] {
       record.content,
       record.summary,
       record.value,
-      record.output,
-      record.reasoning,
-      record.arguments
+      record.output
     ];
 
     const extracted: string[] = [];
@@ -2800,6 +2972,150 @@ function normalizeMessageComparable(value: string) {
     .trim();
 }
 
+function areSessionsEquivalent(previous: AgentSession[], next: AgentSession[]) {
+  if (previous === next) return true;
+  if (!Array.isArray(previous) || !Array.isArray(next)) return false;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const a = previous[index];
+    const b = next[index];
+    if (!a || !b) return false;
+    if (
+      a.id !== b.id ||
+      a.state !== b.state ||
+      a.lastUpdated !== b.lastUpdated ||
+      a.progress !== b.progress ||
+      a.title !== b.title ||
+      a.repo !== b.repo ||
+      a.branch !== b.branch
+    ) {
+      return false;
+    }
+    if (
+      a.tokenUsage?.totalTokens !== b.tokenUsage?.totalTokens ||
+      a.tokenUsage?.promptTokens !== b.tokenUsage?.promptTokens ||
+      a.tokenUsage?.completionTokens !== b.tokenUsage?.completionTokens ||
+      a.tokenUsage?.costUsd !== b.tokenUsage?.costUsd
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function arePendingInputsEquivalent(previous: PendingInput[], next: PendingInput[]) {
+  if (previous === next) return true;
+  if (!Array.isArray(previous) || !Array.isArray(next)) return false;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const a = previous[index];
+    const b = next[index];
+    if (!a || !b) return false;
+    if (
+      a.id !== b.id ||
+      a.sessionId !== b.sessionId ||
+      a.prompt !== b.prompt ||
+      a.requestedAt !== b.requestedAt ||
+      a.priority !== b.priority ||
+      a.actionable !== b.actionable
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function areEventsEquivalent(previous: SessionEvent[], next: SessionEvent[]) {
+  if (previous === next) return true;
+  if (!Array.isArray(previous) || !Array.isArray(next)) return false;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const a = previous[index];
+    const b = next[index];
+    if (!a || !b) return false;
+    if (a.id !== b.id || a.sessionId !== b.sessionId || a.timestamp !== b.timestamp || a.category !== b.category || a.summary !== b.summary) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function areChatTurnsEquivalent(previous: ChatTurn[], next: ChatTurn[]) {
+  if (previous === next) return true;
+  if (!Array.isArray(previous) || !Array.isArray(next)) return false;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const a = previous[index];
+    const b = next[index];
+    if (!a || !b) return false;
+    if (
+      a.id !== b.id ||
+      a.sessionId !== b.sessionId ||
+      a.role !== b.role ||
+      a.kind !== b.kind ||
+      a.createdAt !== b.createdAt ||
+      a.text !== b.text
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function areRunsEquivalent(previous: LauncherRun[], next: LauncherRun[]) {
+  if (previous === next) return true;
+  if (!Array.isArray(previous) || !Array.isArray(next)) return false;
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index += 1) {
+    const a = previous[index];
+    const b = next[index];
+    if (!a || !b) return false;
+    if (
+      a.id !== b.id ||
+      a.sessionId !== b.sessionId ||
+      a.status !== b.status ||
+      a.startedAt !== b.startedAt ||
+      a.endedAt !== b.endedAt ||
+      a.exitCode !== b.exitCode ||
+      a.error !== b.error ||
+      a.resumeCommand !== b.resumeCommand ||
+      a.codexThreadId !== b.codexThreadId ||
+      a.claudeSessionId !== b.claudeSessionId ||
+      a.assistantFinalOutput !== b.assistantFinalOutput
+    ) {
+      return false;
+    }
+
+    const aTail = Array.isArray(a.outputTail) ? a.outputTail : [];
+    const bTail = Array.isArray(b.outputTail) ? b.outputTail : [];
+    if (aTail.length !== bTail.length) return false;
+    if (aTail.length > 0 && aTail[aTail.length - 1] !== bTail[bTail.length - 1]) return false;
+  }
+
+  return true;
+}
+
+function areSettingsEquivalent(previous: SettingsPrefs, next: SettingsPrefs) {
+  return (
+    previous.criticalRealtime === next.criticalRealtime &&
+    previous.digest === next.digest &&
+    previous.pairingHealthy === next.pairingHealthy &&
+    previous.metadataOnly === next.metadataOnly &&
+    previous.darkLocked === next.darkLocked &&
+    previous.networkOnline === next.networkOnline &&
+    previous.workspaceRoot === next.workspaceRoot
+  );
+}
+
 function dedupeSessionList(sessions: AgentSession[], runs: LauncherRun[]) {
   if (!Array.isArray(sessions) || sessions.length === 0) return [];
 
@@ -2846,6 +3162,38 @@ function getCodexThreadId(run: LauncherRun) {
     }
   }
 
+  return "";
+}
+
+function getClaudeSessionId(run: LauncherRun) {
+  const direct = normalizeClaudeSessionId(run.claudeSessionId || "");
+  if (direct) return direct;
+
+  const resume = String(run.resumeCommand || "").trim();
+  const resumeMatch =
+    resume.match(/claude(?:\s+code)?\s+--resume\s+([0-9a-f-]{36})/i) ||
+    resume.match(/claude(?:\s+code)?\s+-r\s+([0-9a-f-]{36})/i);
+  if (resumeMatch?.[1]) {
+    return resumeMatch[1].toLowerCase();
+  }
+
+  const outputTail = Array.isArray(run.outputTail) ? run.outputTail : [];
+  for (let index = outputTail.length - 1; index >= 0; index -= 1) {
+    const parsed = tryParseJsonLine(cleanOutputText(outputTail[index])) as { session_id?: string } | null;
+    if (!parsed?.session_id) continue;
+    const parsedId = normalizeClaudeSessionId(parsed.session_id);
+    if (parsedId) return parsedId;
+  }
+
+  return "";
+}
+
+function normalizeClaudeSessionId(value: string | null | undefined) {
+  const candidate = String(value || "").trim().toLowerCase();
+  if (!candidate) return "";
+  if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(candidate)) {
+    return candidate;
+  }
   return "";
 }
 

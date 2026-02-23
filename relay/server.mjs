@@ -23,9 +23,17 @@ const RELAY_WAKE_POLL_INTERVAL_MS = clamp(toInt(process.env.RELAY_WAKE_POLL_INTE
 const RELAY_WAKE_REQUEST_TIMEOUT_MS = clamp(toInt(process.env.RELAY_WAKE_REQUEST_TIMEOUT_MS, 6000), 1000, 60_000);
 const PAIRING_TTL_MS = clamp(toInt(process.env.PAIRING_TTL_MS, 10 * 60 * 1000), 30_000, 24 * 60 * 60 * 1000);
 const RPC_TIMEOUT_MS = clamp(toInt(process.env.RELAY_RPC_TIMEOUT_MS, 15_000), 500, 60_000);
+const PREVIEW_DEFAULT_TTL_MS = clamp(toInt(process.env.RELAY_PREVIEW_TTL_MS, 2 * 60 * 60 * 1000), 60_000, 7 * 24 * 60 * 60 * 1000);
+const PREVIEW_MAX_TTL_MS = clamp(
+  toInt(process.env.RELAY_PREVIEW_MAX_TTL_MS, 24 * 60 * 60 * 1000),
+  PREVIEW_DEFAULT_TTL_MS,
+  14 * 24 * 60 * 60 * 1000
+);
+const PREVIEW_RPC_TIMEOUT_MS = clamp(toInt(process.env.RELAY_PREVIEW_RPC_TIMEOUT_MS, 30_000), 2000, 120_000);
 const CLEANUP_INTERVAL_MS = 30_000;
 const MAX_LAPTOP_RECORDS = 500;
 const MAX_PHONE_TOKENS = 2_000;
+const MAX_PREVIEW_RECORDS = 4_000;
 
 const STATE_FILE = path.resolve(PROJECT_ROOT, "relay", "state.json");
 const app = express();
@@ -45,8 +53,10 @@ app.use(express.json({ limit: "2mb" }));
 
 app.get("/health", (_req, res) => {
   cleanupExpiredPairings();
+  cleanupExpiredPreviews();
   const onlineLaptops = [...laptopSockets.values()].filter((ws) => ws.readyState === WebSocket.OPEN).length;
   const activePairings = state.pairings.filter((item) => !item.claimedAt && item.expiresAt > Date.now()).length;
+  const activePreviews = state.previews.filter((item) => item.expiresAt > Date.now()).length;
 
   res.json({
     ok: true,
@@ -54,6 +64,7 @@ app.get("/health", (_req, res) => {
     onlineLaptops,
     totalLaptops: state.laptops.length,
     activePairings,
+    activePreviews,
     issuedPhoneTokens: state.phones.length,
     wakeProxyEnabled: Boolean(RELAY_WAKE_PROXY_URL)
   });
@@ -416,6 +427,84 @@ app.post("/api/devices/:id/sessions/:sessionId/messages", async (req, res) => {
   });
 });
 
+app.get("/api/devices/:id/previews", (req, res) => {
+  cleanupExpiredPreviews();
+  const laptop = req.deviceLaptop;
+  const previews = listPreviewsForDevice(laptop.deviceId).map((item) =>
+    serializePreview(item, {
+      connected: isLaptopConnected(item.laptopId)
+    })
+  );
+
+  return res.json({
+    ok: true,
+    previews
+  });
+});
+
+app.post("/api/devices/:id/previews", (req, res) => {
+  cleanupExpiredPreviews();
+  const laptop = req.deviceLaptop;
+  const previewTarget = normalizePreviewTarget(req.body?.targetUrl || req.body?.url, req.body?.port);
+  if (!previewTarget) {
+    return res.status(400).json({
+      ok: false,
+      error: "invalid preview target (use localhost/127.0.0.1 URL or a valid port)"
+    });
+  }
+
+  const requestedTtlSec = toInt(req.body?.expiresInSec, Math.round(PREVIEW_DEFAULT_TTL_MS / 1000));
+  const expiresInSec = clamp(requestedTtlSec, 60, Math.round(PREVIEW_MAX_TTL_MS / 1000));
+  const now = Date.now();
+
+  const preview = {
+    previewId: createId("preview"),
+    accessToken: createToken("pvw"),
+    laptopId: laptop.laptopId,
+    deviceId: laptop.deviceId,
+    label: safeText(req.body?.label, 120) || null,
+    target: previewTarget,
+    createdAt: now,
+    updatedAt: now,
+    lastAccessedAt: null,
+    expiresAt: now + expiresInSec * 1000,
+    createdByPhoneToken: safeText(req.phoneSession?.phoneToken, 500) || null
+  };
+
+  mutateState(() => {
+    state.previews.push(preview);
+    trimStateCollections();
+  });
+
+  return res.status(201).json({
+    ok: true,
+    preview: serializePreview(preview, {
+      connected: isLaptopConnected(preview.laptopId)
+    })
+  });
+});
+
+app.delete("/api/devices/:id/previews/:previewId", (req, res) => {
+  cleanupExpiredPreviews();
+  const previewId = safeText(req.params.previewId, 200);
+  if (!previewId) {
+    return res.status(400).json({ ok: false, error: "previewId is required" });
+  }
+
+  let removed = false;
+  mutateState(() => {
+    const before = state.previews.length;
+    state.previews = state.previews.filter((item) => !(item.previewId === previewId && item.deviceId === req.deviceLaptop.deviceId));
+    removed = state.previews.length !== before;
+  });
+
+  if (!removed) {
+    return res.status(404).json({ ok: false, error: "preview not found" });
+  }
+
+  return res.json({ ok: true });
+});
+
 app.post("/api/devices/:id/wake", async (req, res) => {
   const laptop = req.deviceLaptop;
   const result = await ensureLaptopOnline(laptop, {
@@ -437,6 +526,10 @@ app.post("/api/devices/:id/wake", async (req, res) => {
     connected: isLaptopConnected(laptop.laptopId),
     wakeAttempted: result.wakeAttempted
   });
+});
+
+app.all(/^\/(?:preview|p)\/([^/]+)(?:\/(.*))?$/, (req, res) => {
+  return handlePreviewProxy(req, res);
 });
 
 server.on("upgrade", (request, socket, head) => {
@@ -539,6 +632,7 @@ wss.on("connection", (ws, laptop) => {
 
 const cleanupTicker = setInterval(() => {
   cleanupExpiredPairings();
+  cleanupExpiredPreviews();
 }, CLEANUP_INTERVAL_MS);
 cleanupTicker.unref();
 
@@ -573,21 +667,101 @@ async function proxyToLaptopBridge(req, res, input) {
   }
 }
 
+async function handlePreviewProxy(req, res) {
+  cleanupExpiredPreviews();
+
+  const rawToken =
+    req.params && typeof req.params === "object" ? req.params.token ?? req.params[0] : "";
+  const accessToken = safeText(rawToken, 500);
+  if (!accessToken) {
+    return res.status(400).type("text/plain").send("preview token is required");
+  }
+
+  const preview = findPreviewByAccessToken(accessToken);
+  if (!preview) {
+    return res.status(404).type("text/plain").send("preview link expired or not found");
+  }
+
+  const laptop = findLaptopById(preview.laptopId);
+  if (!laptop) {
+    return res.status(404).type("text/plain").send("preview device not found");
+  }
+
+  const online = await ensureLaptopOnline(laptop, {
+    autoWake: true,
+    wakeIntent: "preview_request"
+  });
+  if (!online.ok) {
+    return res.status(503).type("text/plain").send("laptop is offline");
+  }
+
+  const rawSuffix =
+    req.params && typeof req.params === "object" ? req.params.rest ?? req.params[1] : "";
+  const suffix = safePreviewPathSuffix(rawSuffix);
+  const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+  const proxiedPath = `${suffix}${query}`;
+  const rpcPath =
+    "/__relay/preview/proxy" +
+    withQuery("", {
+      target: preview.target,
+      path: proxiedPath
+    });
+
+  const headers = sanitizePreviewForwardHeaders(req.headers);
+
+  try {
+    const rpc = await sendLaptopRpc(
+      preview.laptopId,
+      {
+        method: String(req.method || "GET").toUpperCase(),
+        path: rpcPath,
+        headers,
+        body: normalizePreviewForwardBody(req)
+      },
+      PREVIEW_RPC_TIMEOUT_MS
+    );
+
+    mutateState(() => {
+      preview.lastAccessedAt = Date.now();
+      preview.updatedAt = Date.now();
+    });
+
+    return relayRpcResponse(res, rpc);
+  } catch (error) {
+    return res.status(resolveRpcErrorStatus(error)).type("text/plain").send(String(error?.message || error));
+  }
+}
+
 function relayRpcResponse(res, rpc) {
   const status = clamp(toInt(rpc?.status, rpc?.ok ? 200 : 500), 100, 599);
   const bodyType = rpc?.bodyType;
+  const hasExplicitContentType = hasHeaderCaseInsensitive(rpc?.responseHeaders, "content-type");
+  applyRpcResponseHeaders(res, rpc?.responseHeaders);
 
   if (bodyType === "empty") {
     return res.status(status).end();
   }
 
+  if (bodyType === "base64" || rpc?.bodyEncoding === "base64") {
+    const payload = typeof rpc?.body === "string" ? Buffer.from(rpc.body, "base64") : Buffer.alloc(0);
+    return res.status(status).send(payload);
+  }
+
   if (bodyType === "text") {
-    return res.status(status).type("text/plain").send(String(rpc?.body ?? ""));
+    const response = res.status(status);
+    if (!hasExplicitContentType) {
+      response.type("text/plain");
+    }
+    return response.send(String(rpc?.body ?? ""));
   }
 
   if (rpc?.body !== undefined) {
     if (typeof rpc.body === "string") {
-      return res.status(status).type("text/plain").send(rpc.body);
+      const response = res.status(status);
+      if (!hasExplicitContentType) {
+        response.type("text/plain");
+      }
+      return response.send(rpc.body);
     }
     return res.status(status).json(rpc.body);
   }
@@ -597,6 +771,29 @@ function relayRpcResponse(res, rpc) {
   }
 
   return res.status(status).json({ ok: Boolean(rpc?.ok) });
+}
+
+function hasHeaderCaseInsensitive(headersInput, name) {
+  if (!isObject(headersInput)) return false;
+  const target = String(name || "").toLowerCase();
+  return Object.keys(headersInput).some((key) => String(key || "").toLowerCase() === target);
+}
+
+function applyRpcResponseHeaders(res, headersInput) {
+  if (!isObject(headersInput)) return;
+
+  for (const [rawName, rawValue] of Object.entries(headersInput)) {
+    if (typeof rawValue !== "string") continue;
+    const name = String(rawName || "").trim();
+    if (!name || /[\r\n]/.test(name)) continue;
+    if (/[^\t\x20-\x7e]/.test(name)) continue;
+    const lower = name.toLowerCase();
+    if (lower === "content-length" || lower === "transfer-encoding" || lower === "connection") continue;
+
+    const value = rawValue.replace(/[\r\n]+/g, " ").trim();
+    if (!value) continue;
+    res.setHeader(name, value);
+  }
 }
 
 function resolveRpcErrorStatus(error) {
@@ -873,6 +1070,8 @@ function settlePendingRpc(laptopId, message) {
     status: toInt(message.status, message.ok ? 200 : 500),
     bodyType: safeText(message.bodyType, 20) || "json",
     body: message.body,
+    bodyEncoding: safeText(message.bodyEncoding, 20) || null,
+    responseHeaders: isObject(message.responseHeaders) ? message.responseHeaders : null,
     error: safeText(message.error, 1000) || null
   });
 }
@@ -981,6 +1180,16 @@ function cleanupExpiredPairings() {
   schedulePersist();
 }
 
+function cleanupExpiredPreviews() {
+  const now = Date.now();
+  const next = state.previews.filter((item) => item.expiresAt > now);
+  if (next.length === state.previews.length) return;
+
+  state.previews = next;
+  state.updatedAt = now;
+  schedulePersist();
+}
+
 function findLaptopById(laptopId) {
   return state.laptops.find((item) => item.laptopId === laptopId) || null;
 }
@@ -1003,6 +1212,112 @@ function findPairingByCode(code) {
 function findPhoneByToken(token) {
   if (!token) return null;
   return state.phones.find((item) => item.phoneToken === token) || null;
+}
+
+function findPreviewByAccessToken(accessToken) {
+  if (!accessToken) return null;
+  return state.previews.find((item) => item.accessToken === accessToken) || null;
+}
+
+function listPreviewsForDevice(deviceId) {
+  if (!deviceId) return [];
+  return state.previews
+    .filter((item) => item.deviceId === deviceId && item.expiresAt > Date.now())
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+function serializePreview(preview, options = {}) {
+  const token = safeText(preview?.accessToken, 500);
+  const publicUrl = token ? `${RELAY_PUBLIC_URL}/p/${encodeURIComponent(token)}` : "";
+  return {
+    id: safeText(preview?.previewId, 200),
+    deviceId: safeText(preview?.deviceId, 200),
+    laptopId: safeText(preview?.laptopId, 200),
+    label: safeText(preview?.label, 120) || null,
+    target: safeText(preview?.target, 2000),
+    createdAt: toInt(preview?.createdAt, Date.now()),
+    updatedAt: toInt(preview?.updatedAt, Date.now()),
+    lastAccessedAt: preview?.lastAccessedAt ? toInt(preview.lastAccessedAt, null) : null,
+    expiresAt: toInt(preview?.expiresAt, Date.now()),
+    connected: options.connected === true,
+    publicUrl
+  };
+}
+
+function normalizePreviewTarget(targetUrlInput, portInput) {
+  let target = safeText(targetUrlInput, 2000);
+  if (!target && portInput !== undefined && portInput !== null && String(portInput).trim()) {
+    const port = toInt(portInput, 0);
+    if (port <= 0 || port > 65535) return "";
+    target = `http://127.0.0.1:${port}`;
+  }
+  if (!target) return "";
+
+  let parsed;
+  try {
+    parsed = new URL(target);
+  } catch {
+    return "";
+  }
+
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  const host = String(parsed.hostname || "").toLowerCase();
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1" && host !== "0.0.0.0") return "";
+
+  const normalized = new URL(`${parsed.protocol}//${host === "0.0.0.0" ? "127.0.0.1" : host}`);
+  if (parsed.port) {
+    const port = toInt(parsed.port, 0);
+    if (port <= 0 || port > 65535) return "";
+    normalized.port = String(port);
+  }
+
+  return trimTrailingSlash(normalized.toString());
+}
+
+function safePreviewPathSuffix(value) {
+  const segment = safeText(value, 4000);
+  if (!segment) return "/";
+  return segment.startsWith("/") ? segment : `/${segment}`;
+}
+
+function sanitizePreviewForwardHeaders(headersInput) {
+  if (!isObject(headersInput)) return {};
+  const out = {};
+
+  for (const [nameRaw, valueRaw] of Object.entries(headersInput)) {
+    if (Array.isArray(valueRaw)) continue;
+    if (typeof valueRaw !== "string") continue;
+    const name = String(nameRaw || "").trim();
+    if (!name) continue;
+    const lower = name.toLowerCase();
+    if (
+      lower === "host" ||
+      lower === "content-length" ||
+      lower === "connection" ||
+      lower === "transfer-encoding" ||
+      lower === "upgrade" ||
+      lower === "authorization" ||
+      lower === "x-phone-token" ||
+      lower === "x-laptop-token"
+    ) {
+      continue;
+    }
+
+    out[name] = valueRaw;
+  }
+
+  return out;
+}
+
+function normalizePreviewForwardBody(req) {
+  const method = String(req.method || "GET").toUpperCase();
+  if (method === "GET" || method === "HEAD") return undefined;
+
+  if (req.body === undefined || req.body === null) return undefined;
+  if (typeof req.body === "string") return req.body;
+  if (Buffer.isBuffer(req.body)) return req.body.toString("utf8");
+  if (typeof req.body === "object") return req.body;
+  return String(req.body);
 }
 
 function withQuery(pathname, queryInput) {
@@ -1079,6 +1394,7 @@ function loadState() {
     laptops: [],
     pairings: [],
     phones: [],
+    previews: [],
     updatedAt: Date.now()
   };
 
@@ -1099,6 +1415,7 @@ function sanitizeState(raw) {
     laptops: [],
     pairings: [],
     phones: [],
+    previews: [],
     updatedAt: Date.now()
   };
 
@@ -1161,10 +1478,30 @@ function sanitizeState(raw) {
         .filter((item) => item.phoneToken && item.deviceId)
     : [];
 
+  const previews = Array.isArray(raw.previews)
+    ? raw.previews
+        .filter((item) => isObject(item))
+        .map((item) => ({
+          previewId: safeText(item.previewId, 200),
+          accessToken: safeText(item.accessToken, 500),
+          laptopId: safeText(item.laptopId, 200),
+          deviceId: safeText(item.deviceId, 200),
+          label: safeText(item.label, 120) || null,
+          target: normalizePreviewTarget(item.target, null),
+          createdAt: toInt(item.createdAt, Date.now()),
+          updatedAt: toInt(item.updatedAt, Date.now()),
+          lastAccessedAt: item.lastAccessedAt ? toInt(item.lastAccessedAt, null) : null,
+          expiresAt: toInt(item.expiresAt, Date.now()),
+          createdByPhoneToken: safeText(item.createdByPhoneToken, 500) || null
+        }))
+        .filter((item) => item.previewId && item.accessToken && item.laptopId && item.deviceId && item.target)
+    : [];
+
   return {
     laptops,
     pairings,
     phones,
+    previews,
     updatedAt: toInt(raw.updatedAt, Date.now())
   };
 }
@@ -1182,6 +1519,13 @@ function trimStateCollections() {
       .slice()
       .sort((a, b) => b.createdAt - a.createdAt)
       .slice(0, MAX_PHONE_TOKENS);
+  }
+
+  if (state.previews.length > MAX_PREVIEW_RECORDS) {
+    state.previews = state.previews
+      .slice()
+      .sort((a, b) => b.updatedAt - a.updatedAt)
+      .slice(0, MAX_PREVIEW_RECORDS);
   }
 }
 

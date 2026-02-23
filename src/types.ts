@@ -113,6 +113,27 @@ export interface Workspace {
   lastModified: number;
 }
 
+export interface PreviewTunnel {
+  id: string;
+  deviceId: string;
+  laptopId: string;
+  label: string | null;
+  target: string;
+  createdAt: number;
+  updatedAt: number;
+  lastAccessedAt: number | null;
+  expiresAt: number;
+  connected: boolean;
+  publicUrl: string;
+}
+
+export interface CreatePreviewInput {
+  port?: number;
+  targetUrl?: string;
+  label?: string;
+  expiresInSec?: number;
+}
+
 export interface SessionsSnapshot {
   sessions: AgentSession[];
   pendingInputs: PendingInput[];
@@ -160,7 +181,9 @@ export interface LauncherRun {
   signal?: string | null;
   error: string | null;
   codexThreadId?: string | null;
+  claudeSessionId?: string | null;
   resumeCommand?: string | null;
+  assistantFinalOutput?: string | null;
   stopRequested: boolean;
   fullWorkspaceAccess?: boolean;
   skipPermissions?: boolean;

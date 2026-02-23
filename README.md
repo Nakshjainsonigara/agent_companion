@@ -13,6 +13,45 @@ Premium dark **web/PWA** for monitoring Codex + Claude Code sessions from phone.
 - Relay pairing flow for phone-to-laptop remote control.
 - Auto-wake support for sleeping laptops (Wake-on-LAN via wake proxy).
 
+## UI workflow (Claude resume thread)
+For UI-only iteration, use your dedicated Claude thread:
+
+```bash
+cd /Users/nakshjain/Desktop/agent
+npm run ui:claude
+```
+
+Background delegation (non-interactive, recommended):
+
+```bash
+cd /Users/nakshjain/Desktop/agent
+npm run ui:delegate -- "Fix chat response UX and composer jump"
+```
+
+This writes job logs to `.agent/ui-jobs/*.log` and metadata to `.agent/ui-jobs/*.json`.
+
+Direct command:
+
+```bash
+claude --resume 9f359518-cae4-4da8-9e55-0ac7e261e85a
+```
+
+Suggested prompt to paste in that thread:
+
+```text
+Need focused UI polish on Agent Companion chat view:
+1) While model is responding, show stable "Thinking..." (no blinking cursor).
+2) Do not show intermediate thinking/token/tool fragments that later disappear.
+3) Render final assistant response cleanly with no flicker or swap-jump.
+4) Fix composer/input/cursor jump (input should stay fixed; no up/down movement during updates).
+
+Constraints:
+- Keep dark premium style intact.
+- Do not change backend contracts.
+- Keep changes minimal and production-safe.
+- Return exact files changed and why.
+```
+
 ## 0) Full remote pairing flow (phone + laptop)
 This is the end-to-end path when users are not on the same local network.
 
@@ -50,7 +89,46 @@ Phone-side API contract (with `Authorization: Bearer <phoneToken>`):
 - `GET /api/devices/:id/launcher/runs`
 - `POST /api/devices/:id/launcher/start`
 - `POST /api/devices/:id/launcher/runs/:runId/stop`
+- `GET /api/devices/:id/previews`
+- `POST /api/devices/:id/previews`
+- `DELETE /api/devices/:id/previews/:previewId`
 - `POST /api/devices/:id/wake`
+
+Public preview URL format:
+- `GET /p/:previewToken/*` (also available as `/preview/:previewToken/*`)
+
+## 0.2) Live preview tunnel (laptop app -> phone browser)
+Expose a locally running app (for example `http://localhost:5173`) to phone through relay:
+
+```bash
+curl -X POST "https://<relay>/api/devices/<deviceId>/previews" \
+  -H "Authorization: Bearer <phoneToken>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "port": 5173,
+    "label": "Vite Preview"
+  }'
+```
+
+Response includes `preview.publicUrl` (for example `https://<relay>/p/<token>`).  
+Open that URL on phone to view the app running on laptop.
+
+List previews:
+```bash
+curl "https://<relay>/api/devices/<deviceId>/previews" \
+  -H "Authorization: Bearer <phoneToken>"
+```
+
+Stop a preview:
+```bash
+curl -X DELETE "https://<relay>/api/devices/<deviceId>/previews/<previewId>" \
+  -H "Authorization: Bearer <phoneToken>"
+```
+
+Notes:
+- Target must be local-only (`localhost`, `127.0.0.1`, `::1`, `0.0.0.0`) for safety.
+- Preview links are temporary (TTL).
+- Laptop still needs internet + relay connection (sleep/offline handled via wake flow if configured).
 
 ## 0.25) Auto-wake for sleeping laptops
 To wake a sleeping laptop automatically before a run/message, deploy the wake proxy on an always-on device in the same LAN as the laptop (small VM, mini-PC, NAS, router host, etc).

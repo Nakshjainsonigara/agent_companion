@@ -2,10 +2,12 @@ import {
   ActionType,
   AgentSession,
   AgentType,
+  CreatePreviewInput,
   LaunchTaskInput,
   LauncherRun,
   PairingConfig,
   PendingInput,
+  PreviewTunnel,
   RemoteDeviceStatus,
   SessionEvent,
   SessionsSnapshot,
@@ -29,6 +31,9 @@ export interface ClientConfig {
 const DEFAULT_BRIDGE_URL = "http://localhost:8787";
 const DEFAULT_RELAY_URL = defaultRelayUrlFromEnv();
 const PAIRING_STORAGE_KEY = "agent_companion_pairing_v1";
+const REMOTE_WAKE_AWARE_TIMEOUT_MS = 95_000;
+const REMOTE_POLL_TIMEOUT_MS = 6_500;
+const REMOTE_MESSAGE_TIMEOUT_MS = 20_000;
 
 let bridgeToken: string | null = null;
 
@@ -49,7 +54,7 @@ export class TokenExpiredError extends Error {
 }
 
 interface RequestOptions {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "DELETE";
   pathLocal: string;
   pathRemote: string;
   timeoutMs: number;
@@ -75,6 +80,7 @@ type CreateWorkspaceInput = {
   workspaceRoot?: string;
 };
 type SettingsUpdateInput = Partial<SettingsPrefs>;
+type PreviewInput = CreatePreviewInput;
 
 type PairingFailure = "INVALID_CODE" | "EXPIRED" | "NETWORK_ERROR" | "UNKNOWN";
 
@@ -128,11 +134,12 @@ export async function fetchBridgeSnapshot(config?: ClientConfig): Promise<Bridge
 
 export async function fetchSessionsSnapshot(config?: ClientConfig): Promise<BridgeSnapshot | null> {
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_POLL_TIMEOUT_MS : 2200;
   return requestJson<BridgeSnapshot>(resolved, {
     method: "GET",
     pathLocal: "/api/bootstrap",
     pathRemote: devicePath(resolved, "/bootstrap"),
-    timeoutMs: 2200
+    timeoutMs
   });
 }
 
@@ -256,15 +263,67 @@ export async function createWorkspace(
 ): Promise<Workspace | null> {
   const { config, input } = normalizeCreateWorkspaceArgs(configOrInput, maybeInput);
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_WAKE_AWARE_TIMEOUT_MS : 4500;
   const data = await requestJson<{ ok: boolean; workspace: Workspace }>(resolved, {
     method: "POST",
     pathLocal: "/api/launcher/workspaces/create",
     pathRemote: devicePath(resolved, "/launcher/workspaces/create"),
-    timeoutMs: 4500,
+    timeoutMs,
     bridgeAuth: true,
     body: input
   });
   return data?.workspace ?? null;
+}
+
+export async function listPreviews(config?: ClientConfig): Promise<PreviewTunnel[]> {
+  const resolved = resolveClientConfig(config);
+  if (!isRemote(resolved)) return [];
+
+  const data = await requestJson<{ ok: boolean; previews: PreviewTunnel[] }>(resolved, {
+    method: "GET",
+    pathLocal: "/api/previews",
+    pathRemote: devicePath(resolved, "/previews"),
+    timeoutMs: REMOTE_POLL_TIMEOUT_MS
+  });
+
+  return data?.previews ?? [];
+}
+
+export async function createPreview(
+  configOrInput: ClientConfig | PreviewInput,
+  maybeInput?: PreviewInput
+): Promise<PreviewTunnel | null> {
+  const { config, input } = normalizePreviewArgs(configOrInput, maybeInput);
+  const resolved = resolveClientConfig(config);
+  if (!isRemote(resolved)) return null;
+
+  const timeoutMs = REMOTE_WAKE_AWARE_TIMEOUT_MS;
+  const data = await requestJson<{ ok: boolean; preview: PreviewTunnel }>(resolved, {
+    method: "POST",
+    pathLocal: "/api/previews",
+    pathRemote: devicePath(resolved, "/previews"),
+    timeoutMs,
+    body: input
+  });
+
+  return data?.preview ?? null;
+}
+
+export async function deletePreview(configOrId: ClientConfig | string, maybeId?: string): Promise<boolean> {
+  const config = maybeId ? resolveClientConfig(configOrId as ClientConfig) : resolveClientConfig(undefined);
+  const previewId = safeTrim(maybeId ?? (configOrId as string));
+  if (!previewId) return false;
+  if (!isRemote(config)) return false;
+
+  const resolved = resolveClientConfig(config);
+  const data = await requestJson<{ ok: boolean }>(resolved, {
+    method: "DELETE",
+    pathLocal: `/api/previews/${encodeURIComponent(previewId)}`,
+    pathRemote: devicePath(resolved, `/previews/${encodeURIComponent(previewId)}`),
+    timeoutMs: 3500
+  });
+
+  return data?.ok === true;
 }
 
 export async function updateSettings(
@@ -273,11 +332,12 @@ export async function updateSettings(
 ): Promise<SettingsPrefs | null> {
   const { config, input } = normalizeUpdateSettingsArgs(configOrInput, maybeInput);
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_WAKE_AWARE_TIMEOUT_MS : 3200;
   const data = await requestJson<{ ok: boolean; settings: SettingsPrefs }>(resolved, {
     method: "POST",
     pathLocal: "/api/settings/update",
     pathRemote: devicePath(resolved, "/settings/update"),
-    timeoutMs: 3200,
+    timeoutMs,
     body: input
   });
   return data?.settings ?? null;
@@ -289,11 +349,12 @@ export async function fetchLauncherRuns(config?: ClientConfig): Promise<Launcher
 
 export async function fetchSessionRuns(config?: ClientConfig, sessionId?: string): Promise<LauncherRun[]> {
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_POLL_TIMEOUT_MS : 2200;
   const data = await requestJson<{ ok: boolean; runs: LauncherRun[] }>(resolved, {
     method: "GET",
     pathLocal: "/api/launcher/runs",
     pathRemote: devicePath(resolved, "/launcher/runs"),
-    timeoutMs: 2200,
+    timeoutMs,
     bridgeAuth: true
   });
   const runs = data?.runs ?? [];
@@ -310,11 +371,12 @@ export async function fetchSessionRun(
   if (!runId) return null;
 
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_POLL_TIMEOUT_MS : 2200;
   const data = await requestJson<{ ok: boolean; run: LauncherRun }>(resolved, {
     method: "GET",
     pathLocal: `/api/launcher/runs/${encodeURIComponent(runId)}`,
     pathRemote: devicePath(resolved, `/launcher/runs/${encodeURIComponent(runId)}`),
-    timeoutMs: 2200,
+    timeoutMs,
     bridgeAuth: true
   });
   return data?.run ?? null;
@@ -326,12 +388,13 @@ export async function launchTask(
 ): Promise<LauncherRun | null> {
   const { config, input } = normalizeLaunchArgs(configOrInput, maybeInput);
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_WAKE_AWARE_TIMEOUT_MS : 5500;
 
   const data = await requestJson<{ ok: boolean; run: LauncherRun }>(resolved, {
     method: "POST",
     pathLocal: "/api/launcher/start",
     pathRemote: devicePath(resolved, "/launcher/start"),
-    timeoutMs: 5500,
+    timeoutMs,
     bridgeAuth: true,
     body: input
   });
@@ -345,6 +408,7 @@ export async function sendSessionMessage(
 ): Promise<{ ok: boolean; delivered: boolean } | null> {
   const { config, input } = normalizeSessionMessageArgs(configOrInput, maybeInput);
   const resolved = resolveClientConfig(config);
+  const timeoutMs = isRemote(resolved) ? REMOTE_MESSAGE_TIMEOUT_MS : 3200;
   const sessionId = safeTrim(input.sessionId);
   const text = safeTrim(input.text);
   if (!sessionId || !text) return null;
@@ -353,7 +417,7 @@ export async function sendSessionMessage(
     method: "POST",
     pathLocal: `/api/sessions/${encodeURIComponent(sessionId)}/messages`,
     pathRemote: devicePath(resolved, `/sessions/${encodeURIComponent(sessionId)}/messages`),
-    timeoutMs: 3200,
+    timeoutMs,
     bridgeAuth: true,
     body: { text }
   });
@@ -447,7 +511,7 @@ async function requestJson<T>(configInput: ClientConfig | undefined, options: Re
     const response = await fetch(`${base}${path}`, {
       method: options.method,
       headers: {
-        ...(options.method === "POST" ? { "Content-Type": "application/json" } : {}),
+        ...(options.body !== undefined ? { "Content-Type": "application/json" } : {}),
         Accept: "application/json",
         ...authHeaders(config, options.bridgeAuth)
       },
@@ -572,6 +636,20 @@ function normalizeUpdateSettingsArgs(
   return {
     config: DEFAULT_CLIENT_CONFIG,
     input: configOrInput as SettingsUpdateInput
+  };
+}
+
+function normalizePreviewArgs(configOrInput: ClientConfig | PreviewInput, maybeInput?: PreviewInput) {
+  if (maybeInput) {
+    return {
+      config: configOrInput as ClientConfig,
+      input: maybeInput
+    };
+  }
+
+  return {
+    config: DEFAULT_CLIENT_CONFIG,
+    input: configOrInput as PreviewInput
   };
 }
 

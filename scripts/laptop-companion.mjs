@@ -315,6 +315,10 @@ async function handleRpcRequest(socket, message) {
 }
 
 async function forwardToLocalBridge(input) {
+  if (input.path.startsWith("/__relay/preview/proxy")) {
+    return forwardPreviewTargetRequest(input);
+  }
+
   const healthy = await ensureBridgeAvailable();
   if (!healthy) {
     return {
@@ -362,6 +366,80 @@ async function forwardToLocalBridge(input) {
     status: response.status,
     bodyType: parsed.bodyType,
     body: parsed.body,
+    bodyEncoding: parsed.bodyEncoding || null,
+    responseHeaders: parsed.responseHeaders || null,
+    error: response.ok ? null : extractErrorMessage(parsed.body)
+  };
+}
+
+async function forwardPreviewTargetRequest(input) {
+  const relayPath = normalizeRelayPath(input.path);
+  const parsedRelayPath = new URL(relayPath, "http://relay.local");
+  const previewTarget = normalizePreviewTarget(parsedRelayPath.searchParams.get("target"));
+  const forwardedPath = normalizePreviewRequestPath(parsedRelayPath.searchParams.get("path"));
+
+  if (!previewTarget || !forwardedPath) {
+    return {
+      ok: false,
+      status: 400,
+      bodyType: "json",
+      body: {
+        ok: false,
+        error: "invalid preview target"
+      },
+      error: "invalid preview target"
+    };
+  }
+
+  const finalUrl = resolvePreviewFinalUrl(previewTarget, forwardedPath);
+  if (!finalUrl) {
+    return {
+      ok: false,
+      status: 400,
+      bodyType: "json",
+      body: {
+        ok: false,
+        error: "invalid preview path"
+      },
+      error: "invalid preview path"
+    };
+  }
+
+  const headers = {
+    Accept: "*/*",
+    ...sanitizePreviewHeaders(input.headers)
+  };
+
+  let body = undefined;
+  if (input.body !== undefined && input.body !== null && input.method !== "GET" && input.method !== "HEAD") {
+    if (typeof input.body === "string" || input.body instanceof String) {
+      body = String(input.body);
+    } else {
+      body = JSON.stringify(input.body);
+      if (!hasHeader(headers, "content-type")) {
+        headers["Content-Type"] = "application/json";
+      }
+    }
+  }
+
+  const response = await fetchWithTimeout(
+    finalUrl,
+    {
+      method: input.method,
+      headers,
+      body
+    },
+    Math.max(15_000, rpcTimeoutMs)
+  );
+
+  const parsed = await parseResponseBody(response);
+  return {
+    ok: response.ok,
+    status: response.status,
+    bodyType: parsed.bodyType,
+    body: parsed.body,
+    bodyEncoding: parsed.bodyEncoding || null,
+    responseHeaders: parsed.responseHeaders || null,
     error: response.ok ? null : extractErrorMessage(parsed.body)
   };
 }
@@ -541,29 +619,138 @@ function sendWsJson(socket, payload) {
 }
 
 async function parseResponseBody(response) {
+  const responseHeaders = extractResponseHeaders(response.headers);
   if (response.status === 204 || response.status === 205) {
-    return { bodyType: "empty", body: null };
-  }
-
-  const text = await response.text();
-  if (!text) {
-    return { bodyType: "empty", body: null };
+    return { bodyType: "empty", body: null, responseHeaders };
   }
 
   const contentType = String(response.headers.get("content-type") || "").toLowerCase();
-  if (contentType.includes("application/json")) {
+  const buffer = Buffer.from(await response.arrayBuffer());
+  if (!buffer.length) {
+    return { bodyType: "empty", body: null, responseHeaders };
+  }
+
+  if (shouldTreatAsText(contentType)) {
+    const text = buffer.toString("utf8");
+    if (contentType.includes("application/json")) {
+      try {
+        return { bodyType: "json", body: JSON.parse(text), responseHeaders };
+      } catch {
+        return { bodyType: "text", body: text, responseHeaders };
+      }
+    }
+
     try {
-      return { bodyType: "json", body: JSON.parse(text) };
+      return { bodyType: "json", body: JSON.parse(text), responseHeaders };
     } catch {
-      return { bodyType: "text", body: text };
+      return { bodyType: "text", body: text, responseHeaders };
     }
   }
 
-  try {
-    return { bodyType: "json", body: JSON.parse(text) };
-  } catch {
-    return { bodyType: "text", body: text };
+  return {
+    bodyType: "base64",
+    bodyEncoding: "base64",
+    body: buffer.toString("base64"),
+    responseHeaders
+  };
+}
+
+function shouldTreatAsText(contentType) {
+  if (!contentType) return true;
+  return (
+    contentType.startsWith("text/") ||
+    contentType.includes("application/json") ||
+    contentType.includes("application/javascript") ||
+    contentType.includes("application/xml") ||
+    contentType.includes("application/xhtml+xml") ||
+    contentType.includes("application/x-www-form-urlencoded") ||
+    contentType.includes("application/graphql") ||
+    contentType.includes("image/svg+xml")
+  );
+}
+
+function extractResponseHeaders(headers) {
+  const allowed = [
+    "content-type",
+    "cache-control",
+    "etag",
+    "last-modified",
+    "expires",
+    "vary",
+    "pragma",
+    "x-powered-by"
+  ];
+  const out = {};
+  for (const name of allowed) {
+    const value = headers.get(name);
+    if (value) out[name] = value;
   }
+  return out;
+}
+
+function normalizePreviewTarget(value) {
+  const raw = safeText(value, 2000);
+  if (!raw) return "";
+  let parsed;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    return "";
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return "";
+  const host = String(parsed.hostname || "").toLowerCase();
+  if (host !== "localhost" && host !== "127.0.0.1" && host !== "::1" && host !== "0.0.0.0") return "";
+
+  const normalizedHost = host === "0.0.0.0" ? "127.0.0.1" : host;
+  const normalized = new URL(`${parsed.protocol}//${normalizedHost}`);
+  if (parsed.port) {
+    const port = toInt(parsed.port, 0);
+    if (port <= 0 || port > 65535) return "";
+    normalized.port = String(port);
+  }
+  return trimTrailingSlash(normalized.toString());
+}
+
+function normalizePreviewRequestPath(value) {
+  const path = safeText(value, 5000);
+  if (!path) return "/";
+  return path.startsWith("/") ? path : `/${path}`;
+}
+
+function resolvePreviewFinalUrl(previewTarget, requestPath) {
+  try {
+    const targetBase = new URL(previewTarget);
+    const candidate = new URL(requestPath, `${targetBase.protocol}//${targetBase.host}`);
+    if (candidate.protocol !== targetBase.protocol || candidate.host !== targetBase.host) {
+      return "";
+    }
+    return candidate.toString();
+  } catch {
+    return "";
+  }
+}
+
+function sanitizePreviewHeaders(input) {
+  if (!isObject(input)) return {};
+  const out = {};
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value !== "string") continue;
+    const lower = key.toLowerCase();
+    if (
+      lower === "host" ||
+      lower === "content-length" ||
+      lower === "connection" ||
+      lower === "transfer-encoding" ||
+      lower === "upgrade" ||
+      lower === "authorization" ||
+      lower === "x-phone-token" ||
+      lower === "x-laptop-token"
+    ) {
+      continue;
+    }
+    out[key] = value;
+  }
+  return out;
 }
 
 function buildLaptopWsUrl(baseUrl, laptopToken) {
@@ -576,7 +763,7 @@ function buildLaptopWsUrl(baseUrl, laptopToken) {
 }
 
 function normalizeRelayPath(inputPath) {
-  const asText = safeText(inputPath, 3000) || "/";
+  const asText = safeText(inputPath, 12_000) || "/";
   if (asText.startsWith("/")) return asText;
   return `/${asText}`;
 }
