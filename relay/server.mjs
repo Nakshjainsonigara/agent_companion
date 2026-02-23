@@ -761,7 +761,7 @@ async function handlePreviewProxy(req, res, options = {}) {
       },
       PREVIEW_RPC_TIMEOUT_MS
     );
-    const rewrittenRpc = maybeRewritePreviewHtmlResponse(rpc, accessToken, preview.target);
+    const rewrittenRpc = maybeRewritePreviewTextResponse(rpc, accessToken, preview.target, proxiedPath);
 
     mutateState(() => {
       preview.lastAccessedAt = Date.now();
@@ -783,43 +783,56 @@ function setPreviewTokenCookie(res, accessToken, expiresAt) {
   res.append("Set-Cookie", cookie);
 }
 
-function maybeRewritePreviewHtmlResponse(rpc, accessToken, previewTarget) {
+function maybeRewritePreviewTextResponse(rpc, accessToken, previewTarget, requestPath) {
   if (!rpc || typeof rpc !== "object") return rpc;
   if (safeText(rpc.bodyType, 20) !== "text") return rpc;
   if (typeof rpc.body !== "string" || !rpc.body) return rpc;
-  if (!isHtmlResponse(rpc.responseHeaders, rpc.body)) return rpc;
 
   const token = safeText(accessToken, 500);
   if (!token) return rpc;
+  const kind = detectPreviewTextKind(rpc.responseHeaders, rpc.body, requestPath);
+  if (!kind) return rpc;
 
   const prefix = `/p/${encodeURIComponent(token)}`;
-  let html = String(rpc.body);
-
-  // Prefix root-relative resource attributes so they keep preview token context.
-  html = html.replace(
-    /(\b(?:href|src|action|poster)\s*=\s*["'])\/(?!\/|p\/|preview\/)/gi,
-    `$1${prefix}/`
-  );
-
-  // Prefix CSS url('/...') references in inline style blocks.
-  html = html.replace(/url\((['"]?)\/(?!\/|p\/|preview\/)/gi, `url($1${prefix}/`);
+  let text = String(rpc.body);
 
   // Rewrite absolute localhost URLs to preview-prefixed paths.
   const origins = buildLocalhostOrigins(previewTarget);
   for (const origin of origins) {
     const escaped = escapeRegExp(origin);
-    html = html.replace(new RegExp(`${escaped}/`, "gi"), `${prefix}/`);
+    text = text.replace(new RegExp(`${escaped}/`, "gi"), `${prefix}/`);
   }
 
-  return {
-    ...rpc,
-    bodyType: "text",
-    body: html,
-    responseHeaders: {
-      ...(isObject(rpc.responseHeaders) ? rpc.responseHeaders : {}),
-      "content-type": "text/html; charset=utf-8"
-    }
+  if (kind === "html") {
+    // Prefix root-relative resource attributes so they keep preview token context.
+    text = text.replace(
+      /(\b(?:href|src|action|poster)\s*=\s*["'])\/(?!\/|p\/|preview\/)/gi,
+      `$1${prefix}/`
+    );
+  }
+
+  if (kind === "html" || kind === "css" || kind === "js") {
+    // Prefix root-relative URL literals in text assets.
+    text = text.replace(/(["'`])\/(?!\/|p\/|preview\/)/g, `$1${prefix}/`);
+    text = text.replace(/url\((['"]?)\/(?!\/|p\/|preview\/)/gi, `url($1${prefix}/`);
+  }
+
+  if (kind === "js") {
+    text = text.replace(/\bfrom\s+(['"])\/(?!\/|p\/|preview\/)/g, `from $1${prefix}/`);
+    text = text.replace(/\bimport\(\s*(['"])\/(?!\/|p\/|preview\/)/g, `import($1${prefix}/`);
+  }
+
+  const nextHeaders = {
+    ...(isObject(rpc.responseHeaders) ? rpc.responseHeaders : {})
   };
+  const existingContentType = getHeaderCaseInsensitive(nextHeaders, "content-type");
+  if (!existingContentType) {
+    if (kind === "html") nextHeaders["content-type"] = "text/html; charset=utf-8";
+    if (kind === "css") nextHeaders["content-type"] = "text/css; charset=utf-8";
+    if (kind === "js") nextHeaders["content-type"] = "application/javascript; charset=utf-8";
+  }
+
+  return { ...rpc, bodyType: "text", body: text, responseHeaders: nextHeaders };
 }
 
 function isHtmlResponse(headersInput, bodyText) {
@@ -828,6 +841,29 @@ function isHtmlResponse(headersInput, bodyText) {
   const sample = safeText(String(bodyText || "").slice(0, 300), 300).toLowerCase();
   if (!sample) return false;
   return sample.includes("<html") || sample.includes("<!doctype html");
+}
+
+function detectPreviewTextKind(headersInput, bodyText, requestPath) {
+  const contentType = getHeaderCaseInsensitive(headersInput, "content-type").toLowerCase();
+  if (contentType.includes("text/html") || contentType.includes("application/xhtml+xml")) return "html";
+  if (contentType.includes("text/css")) return "css";
+  if (contentType.includes("javascript") || contentType.includes("ecmascript")) return "js";
+
+  const pathOnly = safeText(String(requestPath || "").split("?")[0], 2000).toLowerCase();
+  if (pathOnly.endsWith(".html") || pathOnly.endsWith(".htm")) return "html";
+  if (pathOnly.endsWith(".css")) return "css";
+  if (
+    pathOnly.endsWith(".js") ||
+    pathOnly.endsWith(".mjs") ||
+    pathOnly.endsWith(".cjs") ||
+    pathOnly.endsWith(".ts") ||
+    pathOnly.endsWith(".tsx")
+  ) {
+    return "js";
+  }
+
+  if (isHtmlResponse(headersInput, bodyText)) return "html";
+  return "";
 }
 
 function buildLocalhostOrigins(previewTarget) {
