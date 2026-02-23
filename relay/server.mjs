@@ -716,6 +716,12 @@ async function handlePreviewProxy(req, res, options = {}) {
     return res.status(400).type("text/plain").send("preview token is required");
   }
 
+  const hasForcedSuffix = Boolean(safeText(options?.forcedSuffix, 4000));
+  if (!hasForcedSuffix && isPreviewRootPathWithoutTrailingSlash(req.path) && isSafeMethod(req.method)) {
+    const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
+    return res.redirect(307, `${req.path}/${query}`);
+  }
+
   const preview = findPreviewByAccessToken(accessToken);
   if (!preview) {
     return res.status(404).type("text/plain").send("preview link expired or not found");
@@ -804,6 +810,8 @@ function maybeRewritePreviewTextResponse(rpc, accessToken, previewTarget, reques
   }
 
   if (kind === "html") {
+    text = ensurePreviewBaseTag(text, `${prefix}/`);
+
     // Prefix root-relative resource attributes so they keep preview token context.
     text = text.replace(
       /(\b(?:href|src|action|poster)\s*=\s*["'])\/(?!\/|p\/|preview\/)/gi,
@@ -833,6 +841,22 @@ function maybeRewritePreviewTextResponse(rpc, accessToken, previewTarget, reques
   }
 
   return { ...rpc, bodyType: "text", body: text, responseHeaders: nextHeaders };
+}
+
+function ensurePreviewBaseTag(htmlText, baseHref) {
+  let html = String(htmlText || "");
+  const base = String(baseHref || "").trim();
+  if (!base) return html;
+
+  if (/<base\b/i.test(html)) {
+    return html.replace(/<base\b[^>]*href\s*=\s*["'][^"']*["'][^>]*>/i, `<base href="${base}">`);
+  }
+
+  if (/<head\b[^>]*>/i.test(html)) {
+    return html.replace(/<head\b[^>]*>/i, (match) => `${match}\n<base href="${base}">`);
+  }
+
+  return `<base href="${base}">\n${html}`;
 }
 
 function isHtmlResponse(headersInput, bodyText) {
@@ -900,6 +924,17 @@ function extractPreviewTokenFromReferer(req) {
   } catch {
     return "";
   }
+}
+
+function isPreviewRootPathWithoutTrailingSlash(pathname) {
+  const path = safeText(pathname, 2000);
+  if (!path) return false;
+  return /^\/(?:preview|p)\/[^/]+$/i.test(path);
+}
+
+function isSafeMethod(method) {
+  const value = String(method || "").toUpperCase();
+  return value === "GET" || value === "HEAD";
 }
 
 function extractPreviewTokenFromCookie(req) {
@@ -1427,7 +1462,7 @@ function listPreviewsForDevice(deviceId) {
 
 function serializePreview(preview, options = {}) {
   const token = safeText(preview?.accessToken, 500);
-  const publicUrl = token ? `${RELAY_PUBLIC_URL}/p/${encodeURIComponent(token)}` : "";
+  const publicUrl = token ? `${RELAY_PUBLIC_URL}/p/${encodeURIComponent(token)}/` : "";
   return {
     id: safeText(preview?.previewId, 200),
     deviceId: safeText(preview?.deviceId, 200),
