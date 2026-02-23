@@ -391,8 +391,8 @@ async function forwardPreviewTargetRequest(input) {
     };
   }
 
-  const finalUrl = resolvePreviewFinalUrl(previewTarget, forwardedPath);
-  if (!finalUrl) {
+  const candidateUrls = resolvePreviewCandidateUrls(previewTarget, forwardedPath);
+  if (!candidateUrls.length) {
     return {
       ok: false,
       status: 400,
@@ -422,25 +422,45 @@ async function forwardPreviewTargetRequest(input) {
     }
   }
 
-  const response = await fetchWithTimeout(
-    finalUrl,
-    {
-      method: input.method,
-      headers,
-      body
-    },
-    Math.max(15_000, rpcTimeoutMs)
-  );
+  const timeoutMs = Math.max(15_000, rpcTimeoutMs);
+  let lastError = "fetch failed";
 
-  const parsed = await parseResponseBody(response);
+  for (const candidateUrl of candidateUrls) {
+    try {
+      const response = await fetchWithTimeout(
+        candidateUrl,
+        {
+          method: input.method,
+          headers,
+          body
+        },
+        timeoutMs
+      );
+
+      const parsed = await parseResponseBody(response);
+      return {
+        ok: response.ok,
+        status: response.status,
+        bodyType: parsed.bodyType,
+        body: parsed.body,
+        bodyEncoding: parsed.bodyEncoding || null,
+        responseHeaders: parsed.responseHeaders || null,
+        error: response.ok ? null : extractErrorMessage(parsed.body)
+      };
+    } catch (error) {
+      lastError = formatPreviewFetchError(error, candidateUrl);
+    }
+  }
+
   return {
-    ok: response.ok,
-    status: response.status,
-    bodyType: parsed.bodyType,
-    body: parsed.body,
-    bodyEncoding: parsed.bodyEncoding || null,
-    responseHeaders: parsed.responseHeaders || null,
-    error: response.ok ? null : extractErrorMessage(parsed.body)
+    ok: false,
+    status: 502,
+    bodyType: "json",
+    body: {
+      ok: false,
+      error: lastError
+    },
+    error: lastError
   };
 }
 
@@ -717,17 +737,54 @@ function normalizePreviewRequestPath(value) {
   return path.startsWith("/") ? path : `/${path}`;
 }
 
-function resolvePreviewFinalUrl(previewTarget, requestPath) {
+function resolvePreviewCandidateUrls(previewTarget, requestPath) {
   try {
     const targetBase = new URL(previewTarget);
-    const candidate = new URL(requestPath, `${targetBase.protocol}//${targetBase.host}`);
-    if (candidate.protocol !== targetBase.protocol || candidate.host !== targetBase.host) {
-      return "";
+    const isLoopbackHost = (host) => host === "127.0.0.1" || host === "localhost" || host === "::1";
+
+    const hosts = [targetBase.hostname, "127.0.0.1", "localhost", "::1"]
+      .map((host) => String(host || "").trim().toLowerCase())
+      .filter((host) => isLoopbackHost(host))
+      .filter((host, index, all) => all.indexOf(host) === index);
+    if (!hosts.length) return [];
+
+    const protocols = [targetBase.protocol];
+    if (targetBase.protocol === "https:") {
+      protocols.push("http:");
     }
-    return candidate.toString();
+
+    const portPart = targetBase.port ? `:${targetBase.port}` : "";
+    const out = [];
+
+    for (const protocol of protocols) {
+      for (const host of hosts) {
+        const hostForUrl = host === "::1" ? "[::1]" : host;
+        const base = `${protocol}//${hostForUrl}${portPart}`;
+        const candidate = new URL(requestPath, base);
+        if (candidate.protocol !== protocol || !isLoopbackHost(candidate.hostname.toLowerCase())) {
+          continue;
+        }
+        out.push(candidate.toString());
+      }
+    }
+
+    return out.filter((url, index, all) => all.indexOf(url) === index);
   } catch {
-    return "";
+    return [];
   }
+}
+
+function formatPreviewFetchError(error, attemptedUrl) {
+  const baseMessage = String(error?.message || error || "fetch failed");
+  const cause = error && typeof error === "object" ? error.cause : null;
+  const causeCode = cause && typeof cause === "object" ? safeText(cause.code, 80) : "";
+  const causeMessage = cause && typeof cause === "object" ? safeText(cause.message, 240) : "";
+
+  const detail = [causeCode, causeMessage].filter(Boolean).join(" ");
+  if (detail) {
+    return `${baseMessage} (${detail}) at ${attemptedUrl}`;
+  }
+  return `${baseMessage} at ${attemptedUrl}`;
 }
 
 function sanitizePreviewHeaders(input) {
