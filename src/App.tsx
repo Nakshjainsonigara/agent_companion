@@ -672,6 +672,19 @@ function App() {
     [clientConfig, handleTokenExpired, pairingConfig?.mode, selectedSession?.title]
   );
 
+  const handleConversationFeedClickCapture = useCallback(
+    (event: React.MouseEvent<HTMLDivElement>) => {
+      const target = event.target as HTMLElement | null;
+      const anchor = target?.closest("a[href]") as HTMLAnchorElement | null;
+      if (!anchor) return;
+      const href = String(anchor.getAttribute("href") || "").trim();
+      if (!href) return;
+      event.preventDefault();
+      handleConversationLinkOpen(href);
+    },
+    [handleConversationLinkOpen]
+  );
+
   const triggerRefresh = () => {
     setIsRefreshing(true);
     void (async () => {
@@ -1769,7 +1782,7 @@ function App() {
 
                 {/* TUI conversation feed — scrollable */}
                 <div className="-mx-5 flex-1 overflow-y-auto px-5 pt-3">
-                  <div className="space-y-0">
+                  <div className="space-y-0" onClickCapture={handleConversationFeedClickCapture}>
                     {conversationRows.length === 0 ? (
                       <div className="py-12 text-center">
                         <p className="text-[12px] text-muted-foreground/30">~ no output ~</p>
