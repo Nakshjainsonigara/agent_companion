@@ -27,6 +27,7 @@ import {
 import {
   claimPairingCode,
   clearPairingConfig,
+  createPreview,
   createWorkspace,
   DEFAULT_CLIENT_CONFIG,
   fetchDeviceStatus,
@@ -592,6 +593,84 @@ function App() {
     setActiveTab("SESSIONS");
     setShowSessionDetail(true);
   };
+
+  const handleConversationLinkOpen = useCallback(
+    (href: string) => {
+      const fallbackOpen = () => {
+        window.open(href, "_blank", "noopener,noreferrer");
+      };
+
+      let parsed: URL;
+      try {
+        parsed = new URL(href);
+      } catch {
+        fallbackOpen();
+        return;
+      }
+
+      const hostname = String(parsed.hostname || "").toLowerCase();
+      const isLoopback = hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname === "0.0.0.0";
+      if (!isLoopback) {
+        fallbackOpen();
+        return;
+      }
+
+      if (pairingConfig?.mode === "REMOTE") {
+        const previewWindow = window.open("about:blank", "_blank", "noopener,noreferrer");
+        void (async () => {
+          try {
+            const preview = await createPreview(clientConfig, {
+              targetUrl: parsed.toString(),
+              label: selectedSession?.title || "Live Preview",
+              expiresInSec: 2 * 60 * 60,
+            });
+            if (!preview?.publicUrl) {
+              try {
+                previewWindow?.close();
+              } catch {
+                // ignore
+              }
+              setToast("Unable to create preview link");
+              return;
+            }
+            if (previewWindow) {
+              previewWindow.location.href = preview.publicUrl;
+            } else {
+              window.location.assign(preview.publicUrl);
+            }
+          } catch (error) {
+            try {
+              previewWindow?.close();
+            } catch {
+              // ignore
+            }
+            if (error instanceof TokenExpiredError) {
+              handleTokenExpired();
+              return;
+            }
+            setToast("Unable to open localhost preview");
+          }
+        })();
+        return;
+      }
+
+      const currentHost = String(window.location.hostname || "").toLowerCase();
+      const currentIsLoopback =
+        currentHost === "localhost" || currentHost === "127.0.0.1" || currentHost === "::1" || currentHost === "";
+      if (!currentIsLoopback) {
+        const remapped = new URL(parsed.toString());
+        remapped.hostname = currentHost;
+        if (!remapped.port) {
+          remapped.port = window.location.port || remapped.port;
+        }
+        window.open(remapped.toString(), "_blank", "noopener,noreferrer");
+        return;
+      }
+
+      setToast("localhost on phone points to phone. Pair remotely to open via relay preview.");
+    },
+    [clientConfig, handleTokenExpired, pairingConfig?.mode, selectedSession?.title]
+  );
 
   const triggerRefresh = () => {
     setIsRefreshing(true);
@@ -1706,6 +1785,7 @@ function App() {
                             row={row}
                             agentType={selectedSession.agentType}
                             showRole={kindChanged}
+                            onOpenLink={handleConversationLinkOpen}
                           />
                         );
                       })
@@ -2035,7 +2115,13 @@ function SessionRow({
   );
 }
 
-function InlineCode({ text }: { text: string }) {
+function InlineCode({
+  text,
+  onOpenLink,
+}: {
+  text: string;
+  onOpenLink?: (href: string) => void;
+}) {
   // Split text on `backtick` segments and render inline code highlighted
   const parts = text.split(/(`[^`]+`)/g);
   return (
@@ -2051,6 +2137,11 @@ function InlineCode({ text }: { text: string }) {
                 href={href}
                 target="_blank"
                 rel="noreferrer noopener"
+                onClick={(event) => {
+                  if (!onOpenLink) return;
+                  event.preventDefault();
+                  onOpenLink(href);
+                }}
                 className="inline-block cursor-pointer rounded bg-white/[0.06] px-1 py-0.5 text-[11px] text-brand-openai/90 underline decoration-dotted underline-offset-2 transition hover:text-brand-openai pointer-events-auto"
               >
                 {codeText}
@@ -2064,13 +2155,13 @@ function InlineCode({ text }: { text: string }) {
           );
         }
 
-        return <span key={i}>{renderInlineLinks(part, `txt-${i}`)}</span>;
+        return <span key={i}>{renderInlineLinks(part, `txt-${i}`, onOpenLink)}</span>;
       })}
     </>
   );
 }
 
-function renderInlineLinks(text: string, keyPrefix: string) {
+function renderInlineLinks(text: string, keyPrefix: string, onOpenLink?: (href: string) => void) {
   if (!text) return null;
   const urlPattern = /\b(?:https?:\/\/|www\.|localhost:|127\.0\.0\.1:)[^\s<>"'`]+/gi;
   const nodes: ReactNode[] = [];
@@ -2097,6 +2188,11 @@ function renderInlineLinks(text: string, keyPrefix: string) {
           href={href}
           target="_blank"
           rel="noreferrer noopener"
+          onClick={(event) => {
+            if (!onOpenLink) return;
+            event.preventDefault();
+            onOpenLink(href);
+          }}
           className="underline decoration-dotted underline-offset-2 transition hover:text-brand-openai"
         >
           {cleaned}
@@ -2143,7 +2239,15 @@ function getHrefIfLinkLike(value: string) {
   return "";
 }
 
-function AssistantContentBlocks({ blocks, isFinal }: { blocks: ContentBlock[]; isFinal: boolean }) {
+function AssistantContentBlocks({
+  blocks,
+  isFinal,
+  onOpenLink,
+}: {
+  blocks: ContentBlock[];
+  isFinal: boolean;
+  onOpenLink?: (href: string) => void;
+}) {
   return (
     <div className="space-y-2 border-l border-white/[0.06] pl-4">
       {blocks.map((block, i) => {
@@ -2168,7 +2272,7 @@ function AssistantContentBlocks({ blocks, isFinal }: { blocks: ContentBlock[]; i
               {block.items.map((item, j) => (
                 <div key={j} className="flex gap-2 text-[12px] leading-relaxed text-foreground/75">
                   <span className="shrink-0 text-muted-foreground/30">─</span>
-                  <span><InlineCode text={item} /></span>
+                  <span><InlineCode text={item} onOpenLink={onOpenLink} /></span>
                 </div>
               ))}
             </div>
@@ -2178,7 +2282,7 @@ function AssistantContentBlocks({ blocks, isFinal }: { blocks: ContentBlock[]; i
         if (block.type === "step") {
           return (
             <p key={i} className="text-[11px] leading-relaxed text-muted-foreground/45 italic">
-              <InlineCode text={block.text} />
+              <InlineCode text={block.text} onOpenLink={onOpenLink} />
             </p>
           );
         }
@@ -2192,7 +2296,7 @@ function AssistantContentBlocks({ blocks, isFinal }: { blocks: ContentBlock[]; i
               isFinal ? "text-foreground/85" : "text-foreground/60"
             )}
           >
-            <InlineCode text={block.text} />
+            <InlineCode text={block.text} onOpenLink={onOpenLink} />
           </p>
         );
       })}
@@ -2204,10 +2308,12 @@ function ConversationRowView({
   row,
   agentType,
   showRole,
+  onOpenLink,
 }: {
   row: ConversationRow;
   agentType: AgentType;
   showRole: boolean;
+  onOpenLink?: (href: string) => void;
 }) {
   const timeStr = new Date(row.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 
@@ -2234,7 +2340,7 @@ function ConversationRowView({
           </div>
         )}
         <p className="whitespace-pre-wrap pl-4 text-[12px] leading-relaxed text-foreground/90">
-          <InlineCode text={row.text} />
+          <InlineCode text={row.text} onOpenLink={onOpenLink} />
         </p>
       </div>
     );
@@ -2253,7 +2359,7 @@ function ConversationRowView({
           {isFinal && <span className="text-[9px] text-muted-foreground/25">final</span>}
         </div>
       )}
-      <AssistantContentBlocks blocks={blocks} isFinal={isFinal} />
+      <AssistantContentBlocks blocks={blocks} isFinal={isFinal} onOpenLink={onOpenLink} />
     </div>
   );
 }
