@@ -559,6 +559,17 @@ app.all(/^\/(?:preview|p)\/([^/]+)(?:\/(.*))?$/, (req, res) => {
   return handlePreviewProxy(req, res);
 });
 
+// Support assets requested via absolute root paths (e.g. /styles.css) from preview pages.
+// Many local dev servers emit root-absolute URLs, which would otherwise bypass /p/:token.
+app.all(/^\/(?!api(?:\/|$)|ws(?:\/|$)|pair(?:\/|$)|health$|preview(?:\/|$)|p(?:\/|$)).+/, (req, res, next) => {
+  const previewToken = extractPreviewTokenFromReferer(req);
+  if (!previewToken) return next();
+  return handlePreviewProxy(req, res, {
+    forcedToken: previewToken,
+    forcedSuffix: req.path || "/"
+  });
+});
+
 server.on("upgrade", (request, socket, head) => {
   let parsedUrl;
   try {
@@ -694,11 +705,12 @@ async function proxyToLaptopBridge(req, res, input) {
   }
 }
 
-async function handlePreviewProxy(req, res) {
+async function handlePreviewProxy(req, res, options = {}) {
   cleanupExpiredPreviews();
 
   const rawToken =
-    req.params && typeof req.params === "object" ? req.params.token ?? req.params[0] : "";
+    safeText(options?.forcedToken, 500) ||
+    (req.params && typeof req.params === "object" ? req.params.token ?? req.params[0] : "");
   const accessToken = safeText(rawToken, 500);
   if (!accessToken) {
     return res.status(400).type("text/plain").send("preview token is required");
@@ -723,7 +735,8 @@ async function handlePreviewProxy(req, res) {
   }
 
   const rawSuffix =
-    req.params && typeof req.params === "object" ? req.params.rest ?? req.params[1] : "";
+    safeText(options?.forcedSuffix, 4000) ||
+    (req.params && typeof req.params === "object" ? req.params.rest ?? req.params[1] : "");
   const suffix = safePreviewPathSuffix(rawSuffix);
   const query = req.url.includes("?") ? req.url.slice(req.url.indexOf("?")) : "";
   const proxiedPath = `${suffix}${query}`;
@@ -756,6 +769,20 @@ async function handlePreviewProxy(req, res) {
     return relayRpcResponse(res, rpc);
   } catch (error) {
     return res.status(resolveRpcErrorStatus(error)).type("text/plain").send(String(error?.message || error));
+  }
+}
+
+function extractPreviewTokenFromReferer(req) {
+  const refererRaw = safeText(req.header("referer"), 4000);
+  if (!refererRaw) return "";
+
+  try {
+    const parsed = new URL(refererRaw);
+    const match = parsed.pathname.match(/^\/(?:preview|p)\/([^/]+)/i);
+    if (!match || !match[1]) return "";
+    return safeText(decodeURIComponent(match[1]), 500);
+  } catch {
+    return "";
   }
 }
 
