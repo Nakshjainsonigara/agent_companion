@@ -423,6 +423,7 @@ async function forwardPreviewTargetRequest(input) {
   }
 
   const timeoutMs = Math.max(15_000, rpcTimeoutMs);
+  const perAttemptTimeoutMs = Math.max(1500, Math.floor(timeoutMs / Math.max(1, candidateUrls.length)));
   let lastError = "fetch failed";
 
   for (const candidateUrl of candidateUrls) {
@@ -434,7 +435,7 @@ async function forwardPreviewTargetRequest(input) {
           headers,
           body
         },
-        timeoutMs
+        perAttemptTimeoutMs
       );
 
       const parsed = await parseResponseBody(response);
@@ -753,18 +754,25 @@ function resolvePreviewCandidateUrls(previewTarget, requestPath) {
       protocols.push("http:");
     }
 
-    const portPart = targetBase.port ? `:${targetBase.port}` : "";
+    const hasExplicitPort = Boolean(targetBase.port);
+    const defaultPort = targetBase.protocol === "https:" ? "443" : "80";
+    const commonDevPorts = ["5173", "3000", "8080", "4173", "4200", "8000", "8888"];
+    const ports = hasExplicitPort
+      ? [targetBase.port]
+      : [defaultPort, ...commonDevPorts].filter((port, index, all) => all.indexOf(port) === index);
     const out = [];
 
     for (const protocol of protocols) {
       for (const host of hosts) {
-        const hostForUrl = host === "::1" ? "[::1]" : host;
-        const base = `${protocol}//${hostForUrl}${portPart}`;
-        const candidate = new URL(requestPath, base);
-        if (candidate.protocol !== protocol || !isLoopbackHost(candidate.hostname.toLowerCase())) {
-          continue;
+        for (const port of ports) {
+          const hostForUrl = host === "::1" ? "[::1]" : host;
+          const base = `${protocol}//${hostForUrl}:${port}`;
+          const candidate = new URL(requestPath, base);
+          if (candidate.protocol !== protocol || !isLoopbackHost(candidate.hostname.toLowerCase())) {
+            continue;
+          }
+          out.push(candidate.toString());
         }
-        out.push(candidate.toString());
       }
     }
 
