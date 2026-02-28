@@ -1971,6 +1971,7 @@ function normalizeActionType(value) {
 function resolvePendingKind(pending, latestRun) {
   const fromMeta = safeTrimmedText(pending?.meta?.kind, 64).toUpperCase();
   if (fromMeta) return fromMeta;
+  if (safeBoolean(pending?.meta?.questionRequest, false)) return "QUESTION_REQUEST";
   if (safeBoolean(pending?.meta?.planMode, false)) return "PLAN_CONFIRM";
   if (safeBoolean(latestRun?.launchOptions?.planMode, false)) return "PLAN_CONFIRM";
   return "RUNTIME_APPROVAL";

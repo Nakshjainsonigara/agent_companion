@@ -56,6 +56,7 @@ import {
   type LauncherRunStatus,
   type PairingConfig,
   type PendingInput,
+  type QuestionRequestOption,
   type RemoteDeviceStatus,
   type SessionEvent,
   type SessionState,
@@ -167,6 +168,7 @@ function App() {
 
   const [busyActionIds, setBusyActionIds] = useState<string[]>([]);
   const [pendingReplyDrafts, setPendingReplyDrafts] = useState<Record<string, string>>({});
+  const [pendingCustomOpen, setPendingCustomOpen] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [networkOnline, setNetworkOnline] = useState(navigator.onLine);
@@ -241,10 +243,16 @@ function App() {
   );
 
   const handleTokenExpired = useCallback(() => {
-    clearPairingConfig();
-    setPairingConfig(null);
-    setDeviceStatus(null);
-    setToast("Pairing expired. Pair again.");
+    setBridgeConnected(false);
+    setDeviceStatus((previous) =>
+      previous
+        ? {
+            ...previous,
+            online: false
+          }
+        : previous
+    );
+    setToast("Relay auth failed. Keeping pairing and retrying.");
   }, []);
 
   const refreshLiveData = useCallback(
@@ -894,6 +902,32 @@ function App() {
     setPendingReplyDrafts((previous) => ({ ...previous, [pendingId]: value }));
   };
 
+  const selectQuestionOption = (pending: PendingInput, option: QuestionRequestOption) => {
+    const value = String(option.value || option.label || "").trim();
+    if (!value) {
+      setToast("Invalid option");
+      return;
+    }
+    handleAction(pending, "TEXT_REPLY", value);
+    setPendingCustomOpen((prev) => {
+      const next = new Set(prev);
+      next.delete(pending.id);
+      return next;
+    });
+  };
+
+  const toggleCustomReply = (pendingId: string) => {
+    setPendingCustomOpen((prev) => {
+      const next = new Set(prev);
+      if (next.has(pendingId)) {
+        next.delete(pendingId);
+      } else {
+        next.add(pendingId);
+      }
+      return next;
+    });
+  };
+
   const submitPendingReply = (pending: PendingInput) => {
     const draft = String(pendingReplyDrafts[pending.id] || "").trim();
     if (!draft) {
@@ -904,6 +938,11 @@ function App() {
     setPendingReplyDrafts((previous) => {
       const next = { ...previous };
       delete next[pending.id];
+      return next;
+    });
+    setPendingCustomOpen((prev) => {
+      const next = new Set(prev);
+      next.delete(pending.id);
       return next;
     });
   };
@@ -1515,6 +1554,7 @@ function App() {
                       const pendingKind = getPendingKind(pending);
                       const isQuestionRequest = pendingKind === "QUESTION_REQUEST";
                       const toolLabel = getPendingToolLabel(pending);
+                      const questionHeader = getPendingQuestionHeader(pending);
                       const questionOptions = getPendingQuestionOptions(pending);
                       const replyDraft = String(pendingReplyDrafts[pending.id] || "");
 
@@ -1545,6 +1585,11 @@ function App() {
                                   </span>
                                 )}
                               </div>
+                              {questionHeader ? (
+                                <p className="mt-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/45">
+                                  {questionHeader}
+                                </p>
+                              ) : null}
                               <p className="mt-1 text-[12px] leading-snug text-foreground/70">{pending.prompt}</p>
                             </div>
                             <span
@@ -1562,47 +1607,78 @@ function App() {
                           </div>
 
                           {isQuestionRequest ? (
-                            <div className="mt-3 space-y-2">
-                              {questionOptions.length > 0 && (
-                                <div className="flex flex-wrap gap-1.5">
-                                  {questionOptions.map((option) => (
+                            <div className="mt-3 space-y-1.5">
+                                  {questionOptions.map((option, idx) => (
                                     <button
-                                      key={`${pending.id}:${option}`}
+                                      key={`${pending.id}:opt:${idx}`}
                                       type="button"
-                                      onClick={() => updatePendingReplyDraft(pending.id, option)}
-                                      disabled={busy || !actionable}
-                                      className="rounded-full border border-amber-400/25 bg-amber-400/[0.08] px-2.5 py-1 text-[10px] text-amber-300 transition hover:bg-amber-400/[0.16] disabled:opacity-35"
+                                      onClick={() => selectQuestionOption(pending, option)}
+                                  disabled={busy || !actionable}
+                                  className="flex w-full items-start gap-2 rounded-lg border border-white/[0.06] bg-white/[0.02] px-3 py-2 text-left transition hover:border-amber-400/25 hover:bg-amber-400/[0.04] active:bg-amber-400/[0.08] disabled:opacity-35"
                                     >
-                                      {option}
+                                      <span className="shrink-0 rounded bg-white/[0.08] px-1.5 py-0.5 text-[10px] font-bold text-muted-foreground/60">
+                                        {idx + 1}
+                                      </span>
+                                      <span className="min-w-0">
+                                        <span className="block text-[12px] leading-snug text-foreground/84">{option.label}</span>
+                                        {option.description ? (
+                                          <span className="mt-0.5 block text-[10px] leading-snug text-muted-foreground/45">
+                                            {option.description}
+                                          </span>
+                                        ) : null}
+                                      </span>
                                     </button>
                                   ))}
+
+                              {/* "Type your own" toggle */}
+                              {!pendingCustomOpen.has(pending.id) ? (
+                                <button
+                                  type="button"
+                                  onClick={() => toggleCustomReply(pending.id)}
+                                  disabled={busy || !actionable}
+                                  className="flex w-full items-center gap-2 rounded-lg border border-dashed border-white/[0.08] px-3 py-2 text-left transition hover:border-white/[0.15] hover:bg-white/[0.02] disabled:opacity-35"
+                                >
+                                  <span className="shrink-0 rounded bg-white/[0.08] px-1.5 py-0.5 text-[10px] font-bold text-muted-foreground/60">
+                                    ✎
+                                  </span>
+                                  <span className="text-[12px] text-muted-foreground/60">Type your own…</span>
+                                </button>
+                              ) : (
+                                <div className="rounded-lg border border-white/[0.08] bg-white/[0.02] p-2.5">
+                                  <textarea
+                                    rows={2}
+                                    value={replyDraft}
+                                    onChange={(event) => updatePendingReplyDraft(pending.id, event.target.value)}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" && !event.shiftKey) {
+                                        event.preventDefault();
+                                        submitPendingReply(pending);
+                                      }
+                                    }}
+                                    placeholder="Type your reply…"
+                                    className="w-full resize-none bg-transparent text-[12px] text-foreground placeholder:text-muted-foreground/30 focus:outline-none"
+                                    disabled={busy || !actionable}
+                                    autoFocus
+                                  />
+                                  <div className="mt-2 flex items-center gap-2">
+                                    <Button
+                                      size="sm"
+                                      className="flex-1"
+                                      onClick={() => submitPendingReply(pending)}
+                                      disabled={busy || !actionable || !replyDraft.trim()}
+                                    >
+                                      Send
+                                    </Button>
+                                    <Button size="sm" variant="ghost" onClick={() => toggleCustomReply(pending.id)}>
+                                      Cancel
+                                    </Button>
+                                  </div>
                                 </div>
                               )}
-                              <textarea
-                                rows={2}
-                                value={replyDraft}
-                                onChange={(event) => updatePendingReplyDraft(pending.id, event.target.value)}
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter" && !event.shiftKey) {
-                                    event.preventDefault();
-                                    submitPendingReply(pending);
-                                  }
-                                }}
-                                placeholder="Type reply for agent..."
-                                className="w-full resize-none rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-2 text-[12px] text-foreground placeholder:text-muted-foreground/35 focus:border-brand-openai/30 focus:outline-none"
-                                disabled={busy || !actionable}
-                              />
-                              <div className="flex items-center gap-2">
-                                <Button
-                                  size="sm"
-                                  className="flex-1"
-                                  onClick={() => submitPendingReply(pending)}
-                                  disabled={busy || !actionable || !replyDraft.trim()}
-                                >
-                                  Send Reply
-                                </Button>
+
+                              <div className="pt-1">
                                 <Button size="sm" variant="ghost" onClick={() => openSession(pending.sessionId)}>
-                                  Open
+                                  Open Session
                                 </Button>
                               </div>
                             </div>
@@ -2177,6 +2253,7 @@ function App() {
                           const pendingKind = getPendingKind(selectedSessionPending);
                           const isQuestionRequest = pendingKind === "QUESTION_REQUEST";
                           const toolLabel = getPendingToolLabel(selectedSessionPending);
+                          const questionHeader = getPendingQuestionHeader(selectedSessionPending);
                           const questionOptions = getPendingQuestionOptions(selectedSessionPending);
                           const replyDraft = String(pendingReplyDrafts[selectedSessionPending.id] || "");
                           const busy = busyActionIds.includes(selectedSessionPending.id);
@@ -2209,46 +2286,79 @@ function App() {
                                 {isQuestionRequest ? "✎ response needed" : "⚠ approval required"} ·{" "}
                                 {formatRelativeTime(selectedSessionPending.requestedAt)}
                               </p>
+                              {questionHeader ? (
+                                <p className="mt-1 text-[10px] font-semibold uppercase tracking-[0.18em] text-muted-foreground/45">
+                                  {questionHeader}
+                                </p>
+                              ) : null}
                               <p className="mt-1 text-[12px] leading-snug text-foreground/80">{selectedSessionPending.prompt}</p>
 
                               {isQuestionRequest ? (
-                                <div className="mt-2 space-y-2">
-                                  {questionOptions.length > 0 && (
-                                    <div className="flex flex-wrap gap-1.5">
-                                      {questionOptions.map((option) => (
+                                <div className="mt-2 space-y-1">
+                                  {questionOptions.map((option, idx) => (
+                                    <button
+                                      key={`${selectedSessionPending.id}:opt:${idx}`}
+                                      type="button"
+                                      onClick={() => selectQuestionOption(selectedSessionPending, option)}
+                                      disabled={busy || !actionable}
+                                      className="flex w-full items-start gap-2 py-1 text-left transition hover:text-foreground disabled:opacity-35"
+                                    >
+                                      <span className="shrink-0 text-[11px] text-muted-foreground/40">[{idx + 1}]</span>
+                                      <span className="min-w-0">
+                                        <span className="block text-[12px] leading-snug text-foreground/72">{option.label}</span>
+                                        {option.description ? (
+                                          <span className="mt-0.5 block text-[10px] leading-snug text-muted-foreground/35">
+                                            {option.description}
+                                          </span>
+                                        ) : null}
+                                      </span>
+                                    </button>
+                                  ))}
+
+                                  {!pendingCustomOpen.has(selectedSessionPending.id) ? (
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleCustomReply(selectedSessionPending.id)}
+                                      disabled={busy || !actionable}
+                                      className="flex w-full items-center gap-2 py-1 text-left transition hover:text-foreground disabled:opacity-35"
+                                    >
+                                      <span className="shrink-0 text-[11px] text-muted-foreground/40">[✎]</span>
+                                      <span className="text-[12px] text-muted-foreground/40">type your own…</span>
+                                    </button>
+                                  ) : (
+                                    <div className="mt-1 border-l border-white/[0.08] pl-3">
+                                      <textarea
+                                        rows={2}
+                                        value={replyDraft}
+                                        onChange={(event) => updatePendingReplyDraft(selectedSessionPending.id, event.target.value)}
+                                        onKeyDown={(event) => {
+                                          if (event.key === "Enter" && !event.shiftKey) {
+                                            event.preventDefault();
+                                            submitPendingReply(selectedSessionPending);
+                                          }
+                                        }}
+                                        placeholder="type your reply…"
+                                        disabled={busy || !actionable}
+                                        className="w-full resize-none bg-transparent text-[12px] text-foreground placeholder:text-muted-foreground/25 focus:outline-none disabled:opacity-40"
+                                        autoFocus
+                                      />
+                                      <div className="mt-1 flex gap-2">
                                         <button
-                                          key={`${selectedSessionPending.id}:${option}`}
-                                          type="button"
-                                          disabled={busy || !actionable}
-                                          onClick={() => updatePendingReplyDraft(selectedSessionPending.id, option)}
-                                          className="rounded border border-amber-400/25 bg-amber-400/[0.08] px-2 py-1 text-[10px] text-amber-300 transition hover:bg-amber-400/[0.16] disabled:opacity-35"
+                                          disabled={busy || !actionable || !replyDraft.trim()}
+                                          onClick={() => submitPendingReply(selectedSessionPending)}
+                                          className="rounded border border-amber-400/25 bg-amber-400/[0.06] px-2.5 py-0.5 text-[10px] text-amber-400 transition hover:bg-amber-400/[0.12] disabled:opacity-30"
                                         >
-                                          {option}
+                                          [↵] send
                                         </button>
-                                      ))}
+                                        <button
+                                          onClick={() => toggleCustomReply(selectedSessionPending.id)}
+                                          className="text-[10px] text-muted-foreground/40 transition hover:text-foreground"
+                                        >
+                                          cancel
+                                        </button>
+                                      </div>
                                     </div>
                                   )}
-                                  <textarea
-                                    rows={2}
-                                    value={replyDraft}
-                                    onChange={(event) => updatePendingReplyDraft(selectedSessionPending.id, event.target.value)}
-                                    onKeyDown={(event) => {
-                                      if (event.key === "Enter" && !event.shiftKey) {
-                                        event.preventDefault();
-                                        submitPendingReply(selectedSessionPending);
-                                      }
-                                    }}
-                                    placeholder="Type reply for agent..."
-                                    disabled={busy || !actionable}
-                                    className="w-full resize-none rounded border border-white/[0.08] bg-white/[0.03] px-2 py-1.5 text-[12px] text-foreground placeholder:text-muted-foreground/35 focus:border-brand-openai/30 focus:outline-none disabled:opacity-40"
-                                  />
-                                  <button
-                                    disabled={busy || !actionable || !replyDraft.trim()}
-                                    onClick={() => submitPendingReply(selectedSessionPending)}
-                                    className="rounded border border-brand-openai/30 bg-brand-openai/[0.08] px-3 py-1 text-[11px] text-brand-openai transition hover:bg-brand-openai/[0.14] disabled:opacity-30"
-                                  >
-                                    [↵] send reply
-                                  </button>
                                 </div>
                               ) : (
                                 <div className="mt-2 flex gap-2">
@@ -3892,13 +4002,17 @@ function getPendingToolLabel(pending: PendingInput) {
   return "";
 }
 
-function getPendingQuestionOptions(pending: PendingInput) {
+function getPendingQuestionHeader(pending: PendingInput) {
+  const meta = pending?.meta && typeof pending.meta === "object" ? pending.meta : null;
+  return String(meta?.questionHeader || "").trim().slice(0, 120);
+}
+
+function getPendingQuestionOptions(pending: PendingInput): QuestionRequestOption[] {
   const meta = pending?.meta && typeof pending.meta === "object" ? pending.meta : null;
   const direct = Array.isArray(meta?.questionOptions)
     ? meta.questionOptions
-        .map((item) => String(item || "").trim())
-        .filter(Boolean)
-        .slice(0, 6)
+        .map(normalizeQuestionOption)
+        .filter((option): option is QuestionRequestOption => Boolean(option))
     : [];
   if (direct.length > 0) return direct;
 
@@ -3908,24 +4022,43 @@ function getPendingQuestionOptions(pending: PendingInput) {
     .map((line) => line.trim())
     .map((line) => {
       const bulletMatch = line.match(/^[-*•]\s+(.{2,180})$/);
-      if (bulletMatch?.[1]) return bulletMatch[1].trim();
+      if (bulletMatch?.[1]) return normalizeQuestionOption(bulletMatch[1].trim());
       const numberedMatch = line.match(/^(?:\d{1,2}[.)]|[A-Da-d][.)])\s+(.{2,180})$/);
-      if (numberedMatch?.[1]) return numberedMatch[1].trim();
-      return "";
+      if (numberedMatch?.[1]) return normalizeQuestionOption(numberedMatch[1].trim());
+      return null;
     })
-    .filter(Boolean);
+    .filter(Boolean) as QuestionRequestOption[];
 
   const deduped: string[] = [];
   const seen = new Set<string>();
   for (const option of options) {
-    const normalized = option.toLowerCase();
+    const normalized = option.label.toLowerCase();
     if (seen.has(normalized)) continue;
     seen.add(normalized);
-    deduped.push(option.slice(0, 140));
+    deduped.push(option.label.slice(0, 140));
     if (deduped.length >= 6) break;
   }
 
-  return deduped;
+  return deduped.map((label) => ({ label }));
+}
+
+function normalizeQuestionOption(option: unknown): QuestionRequestOption | null {
+  if (typeof option === "string") {
+    const label = option.trim().slice(0, 140);
+    return label ? { label } : null;
+  }
+  if (!option || typeof option !== "object") return null;
+  const label = String((option as { label?: unknown; value?: unknown }).label || (option as { value?: unknown }).value || "")
+    .trim()
+    .slice(0, 140);
+  const description = String((option as { description?: unknown }).description || "").trim().slice(0, 220);
+  const value = String((option as { value?: unknown }).value || label).trim().slice(0, 140);
+  if (!label) return null;
+  return {
+    label,
+    description: description || undefined,
+    value: value || undefined,
+  };
 }
 
 function isDirectSessionId(sessionId: string) {

@@ -261,7 +261,9 @@ function emitPendingRequest({
   toolCall = null,
   toolName = null,
   questionRequest = false,
+  questionHeader = null,
   questionOptions = null,
+  multiSelect = false,
   priority = "HIGH"
 }) {
   const cleanedPrompt = String(prompt || "").trim().slice(0, 220);
@@ -284,10 +286,16 @@ function emitPendingRequest({
       toolCall: toolCall || null,
       toolName: toolName || null,
       questionRequest: Boolean(questionRequest),
+      questionHeader: questionHeader ? String(questionHeader).trim().slice(0, 120) : null,
       questionOptions:
         Array.isArray(questionOptions) && questionOptions.length > 0
-          ? questionOptions.slice(0, 6).map((item) => String(item || "").trim()).filter(Boolean)
+          ? questionOptions
+              .slice(0, 6)
+              .map((item) => normalizeQuestionOption(item))
+              .filter(Boolean)
           : null
+      ,
+      multiSelect: Boolean(multiSelect)
     }
   });
 
@@ -330,7 +338,9 @@ function tryHandleStructuredJsonLine(line) {
       prompt: askUserQuestion.question,
       kind: "QUESTION_REQUEST",
       questionRequest: true,
-      questionOptions: askUserQuestion.options
+      questionHeader: askUserQuestion.header,
+      questionOptions: askUserQuestion.options,
+      multiSelect: askUserQuestion.multiSelect
     });
     handled = handled || emitted;
   }
@@ -470,6 +480,7 @@ function maybeEmitInputRequest(line) {
   if (isQuestionRequest && questionOptions.length === 0) {
     questionOptions = extractQuestionOptionsFromSerializedPayload(trimmed);
   }
+  const questionHeader = isQuestionRequest ? extractQuestionHeaderFromSerializedPayload(trimmed) : null;
 
   if (!needsInput && !isToolPermission && !isQuestionRequest) return;
   const approvalPrompt = extractApprovalPrompt(trimmed, lastToolCallHint, isQuestionRequest).slice(0, 220);
@@ -487,6 +498,7 @@ function maybeEmitInputRequest(line) {
     toolCall: lastToolCallHint || null,
     toolName: toolName || null,
     questionRequest: isQuestionRequest,
+    questionHeader,
     questionOptions: questionOptions.length > 0 ? questionOptions : null
   });
 }
@@ -620,10 +632,10 @@ function extractQuestionOptions(text) {
   const deduped = [];
   const seen = new Set();
   for (const option of options) {
-    const normalized = option.toLowerCase();
+    const normalized = String(option || "").toLowerCase();
     if (!normalized || seen.has(normalized)) continue;
     seen.add(normalized);
-    deduped.push(option.slice(0, 140));
+    deduped.push(normalizeQuestionOption(option));
     if (deduped.length >= 6) break;
   }
 
@@ -638,25 +650,63 @@ function extractQuestionFromSerializedPayload(text) {
   return unescapeJsonText(match[1]).slice(0, 220);
 }
 
+function extractQuestionHeaderFromSerializedPayload(text) {
+  const candidate = String(text || "");
+  if (!candidate) return "";
+  const match = candidate.match(/"header"\s*:\s*"([^"]{1,120})"/i);
+  if (!match?.[1]) return "";
+  return unescapeJsonText(match[1]).slice(0, 120);
+}
+
 function extractQuestionOptionsFromSerializedPayload(text) {
   const candidate = String(text || "");
   if (!candidate) return [];
-  const matches = [...candidate.matchAll(/"label"\s*:\s*"([^"]{1,180})"/gi)];
-  if (!matches.length) return [];
+  const optionBlocks = [...candidate.matchAll(/"label"\s*:\s*"([^"]{1,180})"[\s\S]{0,220}?"description"\s*:\s*"([^"]{1,220})"/gi)];
+  if (optionBlocks.length > 0) {
+    return optionBlocks
+      .slice(0, 6)
+      .map((match) =>
+        normalizeQuestionOption({
+          label: unescapeJsonText(match[1]),
+          description: unescapeJsonText(match[2])
+        })
+      )
+      .filter(Boolean);
+  }
+
+  const labelMatches = [...candidate.matchAll(/"label"\s*:\s*"([^"]{1,180})"/gi)];
+  if (!labelMatches.length) return [];
 
   const deduped = [];
   const seen = new Set();
-  for (const match of matches) {
+  for (const match of labelMatches) {
     const value = unescapeJsonText(String(match[1] || "").trim());
     if (!value) continue;
     const normalized = value.toLowerCase();
     if (seen.has(normalized)) continue;
     seen.add(normalized);
-    deduped.push(value.slice(0, 140));
+    deduped.push(normalizeQuestionOption(value));
     if (deduped.length >= 6) break;
   }
 
   return deduped;
+}
+
+function normalizeQuestionOption(option) {
+  if (typeof option === "string") {
+    const label = option.trim().slice(0, 140);
+    return label ? { label } : null;
+  }
+  if (!option || typeof option !== "object") return null;
+  const label = String(option.label || option.value || "").trim().slice(0, 140);
+  const description = String(option.description || "").trim().slice(0, 220);
+  const value = String(option.value || label || "").trim().slice(0, 140);
+  if (!label) return null;
+  return {
+    label,
+    description: description || undefined,
+    value: value || undefined
+  };
 }
 
 function unescapeJsonText(value) {
@@ -723,24 +773,20 @@ function parseAskUserQuestionInput(input) {
 
   const question = String(first.question || first.prompt || "").trim();
   if (!question) return null;
+  const header = String(first.header || "").trim().slice(0, 120);
 
   const options = Array.isArray(first.options)
     ? first.options
-        .map((option) => {
-          if (typeof option === "string") return option.trim();
-          if (!option || typeof option !== "object") return "";
-          const label = String(option.label || "").trim();
-          const description = String(option.description || "").trim();
-          if (label && description) return `${label} — ${description}`.slice(0, 180);
-          return label || description;
-        })
+        .map((option) => normalizeQuestionOption(option))
         .filter(Boolean)
         .slice(0, 6)
     : [];
 
   return {
     question: question.slice(0, 220),
-    options
+    header: header || null,
+    options,
+    multiSelect: Boolean(first.multiSelect)
   };
 }
 

@@ -85,7 +85,27 @@ export interface PendingInput {
   priority: "HIGH" | "MEDIUM" | "LOW";
   actionable?: boolean;
   source?: "BRIDGE" | "DIRECT" | string;
-  meta?: Record<string, unknown> | null;
+  meta?: PendingInputMeta | null;
+}
+
+export interface QuestionRequestOption {
+  label: string;
+  description?: string;
+  value?: string;
+}
+
+export interface PendingInputMeta {
+  kind?: string;
+  planMode?: boolean;
+  agentType?: AgentType;
+  runId?: string | null;
+  toolCall?: string | null;
+  toolName?: string | null;
+  questionRequest?: boolean;
+  questionHeader?: string | null;
+  questionOptions?: Array<QuestionRequestOption | string> | null;
+  multiSelect?: boolean;
+  [key: string]: unknown;
 }
 
 export interface UserAction {
