@@ -13,7 +13,7 @@ const relayBaseUrl = trimTrailingSlash(args.relay || process.env.AGENT_RELAY_URL
 const bridgeBaseUrl = trimTrailingSlash(args.bridge || process.env.AGENT_LOCAL_BRIDGE_URL || "http://localhost:8787");
 const bridgeToken = String(args.bridgeToken || process.env.AGENT_BRIDGE_TOKEN || "").trim();
 const quietLogs = String(args.quiet || process.env.AGENT_COMPANION_QUIET || "1").trim() !== "0";
-const snapshotIntervalMs = clamp(toInt(args["snapshot-interval"], 4000), 1000, 60_000);
+const snapshotIntervalMs = clamp(toInt(args["snapshot-interval"], 2000), 1000, 60_000);
 const rpcTimeoutMs = clamp(toInt(args["rpc-timeout"], 12_000), 1000, 60_000);
 const bridgeStartupTimeoutMs = clamp(toInt(args["bridge-startup-timeout"], 9000), 2000, 60_000);
 const bridgeProbeBeforeSpawnMs = clamp(toInt(args["bridge-probe-before-spawn"], 1200), 200, 10_000);

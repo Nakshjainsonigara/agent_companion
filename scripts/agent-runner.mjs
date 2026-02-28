@@ -19,6 +19,7 @@ const options = parseOptions(optionArgs);
 const agentType = options.agent === "CLAUDE" ? "CLAUDE" : "CODEX";
 const bridgeUrl = options.bridge || process.env.AGENT_BRIDGE_URL || "http://localhost:8787";
 const sessionId = options.session || `${agentType.toLowerCase()}_${Date.now()}`;
+const runId = String(options.run || "").trim();
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const backgroundHelperPath = path.resolve(__dirname, "background-service.mjs");
@@ -59,6 +60,8 @@ if (usage.totalTokens === 0) {
 const startTime = Date.now();
 let lastPendingAt = 0;
 let lastUpsertAt = 0;
+let lastToolCallHint = "";
+let lastPendingFingerprint = "";
 let done = false;
 let codexThreadId = "";
 let claudeSessionId = "";
@@ -234,6 +237,75 @@ function handleOutputLine(line) {
   maybeEmitMilestoneEvent(line);
 }
 
+function tryMarkPendingEmission(kind, prompt) {
+  const now = Date.now();
+  const normalizedKind = String(kind || "RUNTIME_APPROVAL").trim().toUpperCase();
+  const normalizedPrompt = String(prompt || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 220);
+  const fingerprint = `${normalizedKind}|${normalizedPrompt}`;
+  if (fingerprint && fingerprint === lastPendingFingerprint && now - lastPendingAt < 90_000) {
+    return false;
+  }
+  if (now - lastPendingAt < 30_000) return false;
+  lastPendingAt = now;
+  lastPendingFingerprint = fingerprint;
+  return true;
+}
+
+function emitPendingRequest({
+  prompt,
+  kind,
+  toolCall = null,
+  toolName = null,
+  questionRequest = false,
+  questionOptions = null,
+  priority = "HIGH"
+}) {
+  const cleanedPrompt = String(prompt || "").trim().slice(0, 220);
+  if (!cleanedPrompt) return false;
+  const normalizedKind = String(kind || "RUNTIME_APPROVAL").trim().toUpperCase() || "RUNTIME_APPROVAL";
+  if (!tryMarkPendingEmission(normalizedKind, cleanedPrompt)) return false;
+
+  void safePost("/api/pending/add", {
+    sessionId,
+    prompt: cleanedPrompt,
+    priority,
+    requestedAt: Date.now(),
+    actionable: true,
+    source: "RUNNER",
+    meta: {
+      kind: normalizedKind,
+      planMode: launchOptions.planMode,
+      agentType,
+      runId: runId || null,
+      toolCall: toolCall || null,
+      toolName: toolName || null,
+      questionRequest: Boolean(questionRequest),
+      questionOptions:
+        Array.isArray(questionOptions) && questionOptions.length > 0
+          ? questionOptions.slice(0, 6).map((item) => String(item || "").trim()).filter(Boolean)
+          : null
+    }
+  });
+
+  void safePost("/api/sessions/upsert", {
+    id: sessionId,
+    agentType,
+    title,
+    repo,
+    branch,
+    state: "WAITING_INPUT",
+    progress: Math.min(99, 6 + Math.floor((Date.now() - startTime) / 7000)),
+    lastUpdated: Date.now(),
+    tokenUsage: usage
+  });
+
+  return true;
+}
+
 function tryHandleStructuredJsonLine(line) {
   const trimmed = line.trim();
   if (!trimmed || trimmed[0] !== "{") return false;
@@ -246,9 +318,26 @@ function tryHandleStructuredJsonLine(line) {
   }
 
   if (!payload || typeof payload !== "object") return true;
+  let handled = false;
+  const toolHint = extractToolHintFromPayload(payload);
+  if (toolHint) {
+    lastToolCallHint = toolHint;
+    handled = true;
+  }
+  const askUserQuestion = extractAskUserQuestionPayload(payload);
+  if (askUserQuestion) {
+    const emitted = emitPendingRequest({
+      prompt: askUserQuestion.question,
+      kind: "QUESTION_REQUEST",
+      questionRequest: true,
+      questionOptions: askUserQuestion.options
+    });
+    handled = handled || emitted;
+  }
 
   const payloadSessionId = normalizeUuid(payload.session_id);
   if (payloadSessionId) {
+    handled = true;
     if (!claudeSessionId) {
       claudeSessionId = payloadSessionId;
       console.log(`[agent-runner] claude_session=${claudeSessionId}`);
@@ -299,6 +388,7 @@ function tryHandleStructuredJsonLine(line) {
   }
 
   if (payload.type === "item.completed" && payload.item && typeof payload.item === "object") {
+    handled = true;
     if (payload.item.type === "agent_message" && typeof payload.item.text === "string") {
       const message = payload.item.text.trim();
       if (message) {
@@ -310,6 +400,7 @@ function tryHandleStructuredJsonLine(line) {
   }
 
   if (payload.type === "assistant" && payload.message && typeof payload.message === "object") {
+    handled = true;
     const message = payload.message;
     const assistantText = extractStructuredText(message.content || message.text);
     if (assistantText) {
@@ -321,6 +412,7 @@ function tryHandleStructuredJsonLine(line) {
   }
 
   if (payload.type === "result") {
+    handled = true;
     const resultText = typeof payload.result === "string" ? payload.result.trim() : "";
     if (resultText) {
       maybeEmitInputRequest(resultText);
@@ -333,7 +425,16 @@ function tryHandleStructuredJsonLine(line) {
     return true;
   }
 
-  return true;
+  const fallbackText = extractStructuredText(
+    payload.message || payload.result || payload.content || payload.text || payload.payload
+  );
+  if (fallbackText) {
+    maybeEmitInputRequest(fallbackText);
+    maybeEmitMilestoneEvent(fallbackText);
+    return true;
+  }
+
+  return handled;
 }
 
 function maybeEmitMilestoneEvent(line) {
@@ -358,35 +459,339 @@ function maybeEmitInputRequest(line) {
   const trimmed = line.trim();
   if (!trimmed) return;
 
-  const needsInput = /input required|needs input|approval[_\s-]*required|awaiting approval|please approve|approve (?:this|the) plan|should i (?:proceed|implement|execute)|would you like me to (?:proceed|implement|execute)|ready to (?:implement|execute)|want me to (?:implement|execute)/i.test(
+  const needsInput = /input required|needs input|approval[_\s-]*required|awaiting approval|please approve|approve (?:this|the) plan|should i (?:proceed|implement|execute)|would you like me to (?:proceed|implement|execute)|ready to (?:implement|execute)|want me to (?:implement|execute)/i.test(trimmed);
+  const needsQuestionAnswer = isClarifyingQuestionRequest(trimmed);
+  const toolPermissionHint = /\[request interrupted by user for tool use\]|tool[_\s-]*(?:approval|permission)|allow.*tool/i.test(
     trimmed
   );
+  const isToolPermission = toolPermissionHint || (needsInput && Boolean(lastToolCallHint));
+  const isQuestionRequest = !isToolPermission && !needsInput && needsQuestionAnswer;
+  let questionOptions = isQuestionRequest ? extractQuestionOptions(trimmed) : [];
+  if (isQuestionRequest && questionOptions.length === 0) {
+    questionOptions = extractQuestionOptionsFromSerializedPayload(trimmed);
+  }
 
-  if (!needsInput) return;
-  if (Date.now() - lastPendingAt < 30_000) return;
-
-  lastPendingAt = Date.now();
-
-  void safePost("/api/pending/add", {
-    sessionId,
-    prompt: trimmed.slice(0, 220),
-    priority: "HIGH",
-    requestedAt: Date.now(),
-    actionable: true,
-    source: "RUNNER"
+  if (!needsInput && !isToolPermission && !isQuestionRequest) return;
+  const approvalPrompt = extractApprovalPrompt(trimmed, lastToolCallHint, isQuestionRequest).slice(0, 220);
+  const pendingKind = isQuestionRequest
+    ? "QUESTION_REQUEST"
+    : isToolPermission
+      ? "TOOL_PERMISSION"
+      : launchOptions.planMode
+        ? "PLAN_CONFIRM"
+        : "RUNTIME_APPROVAL";
+  const toolName = extractToolNameFromHint(lastToolCallHint);
+  emitPendingRequest({
+    prompt: approvalPrompt || trimmed.slice(0, 220),
+    kind: pendingKind,
+    toolCall: lastToolCallHint || null,
+    toolName: toolName || null,
+    questionRequest: isQuestionRequest,
+    questionOptions: questionOptions.length > 0 ? questionOptions : null
   });
+}
 
-  void safePost("/api/sessions/upsert", {
-    id: sessionId,
-    agentType,
-    title,
-    repo,
-    branch,
-    state: "WAITING_INPUT",
-    progress: Math.min(99, 6 + Math.floor((Date.now() - startTime) / 7000)),
-    lastUpdated: Date.now(),
-    tokenUsage: usage
-  });
+function extractApprovalPrompt(text, toolHint = "", isQuestionRequest = false) {
+  const cleaned = String(text || "").replace(/\r/g, "").trim();
+  if (!cleaned) return "";
+
+  if (/\[request interrupted by user for tool use\]|tool[_\s-]*(?:approval|permission)/i.test(cleaned) && toolHint) {
+    return `Approve tool call: ${toolHint}`;
+  }
+  if (isQuestionRequest) {
+    const structuredQuestion = extractQuestionFromSerializedPayload(cleaned);
+    if (structuredQuestion) return structuredQuestion;
+    const inferredNeedToKnow =
+      cleaned.match(/(before i can [^.!?]{0,180}need to know[^.!?]{0,180})/i)?.[1] ||
+      cleaned.match(/(i need to know [^.!?]{0,200})/i)?.[1];
+    if (inferredNeedToKnow) {
+      return inferredNeedToKnow.trim().replace(/\s+/g, " ").slice(0, 220);
+    }
+    const question = extractBestQuestion(cleaned);
+    if (question) return question;
+    return cleaned;
+  }
+
+  const lines = cleaned
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (isApprovalQuestion(lines[index])) {
+      return lines[index];
+    }
+  }
+
+  const sentences = cleaned
+    .split(/(?<=[.?!])\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (let index = sentences.length - 1; index >= 0; index -= 1) {
+    if (isApprovalQuestion(sentences[index])) {
+      return sentences[index];
+    }
+  }
+
+  return cleaned;
+}
+
+function isApprovalQuestion(text) {
+  const candidate = String(text || "").trim();
+  if (!candidate) return false;
+  return /approval[_\s-]*required|awaiting approval|please approve|approve (?:this|the) plan|should i (?:proceed|implement|execute)|would you like me to (?:proceed|implement|execute)|ready to (?:implement|execute)|want me to (?:implement|execute)|proceed with implementation/i.test(
+    candidate
+  );
+}
+
+function isClarifyingQuestionRequest(text) {
+  const candidate = String(text || "").trim();
+  if (!candidate) return false;
+  if (/input required|approval[_\s-]*required|awaiting approval|please approve/i.test(candidate)) return false;
+  if (/askuserquestion|\"question\"\s*:/i.test(candidate)) return true;
+  if (/[?]/.test(candidate) && /\b(can you|could you|would you|which|what|where|when|how|do you)\b/i.test(candidate)) {
+    return true;
+  }
+  if (/before i (?:dive|start|proceed)|i have (?:a few|some) questions|need more context|could you clarify|share (?:more|the) details|tell me more/i.test(candidate)) {
+    return true;
+  }
+  if (/before i can .*need to know|i need to know what feature|i need to know (?:what|which|where|when|how)|i'?ve asked the question/i.test(candidate)) {
+    return true;
+  }
+  return false;
+}
+
+function extractBestQuestion(text) {
+  const cleaned = String(text || "").trim();
+  if (!cleaned) return "";
+
+  const lines = cleaned
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (/\?$/.test(lines[index])) return lines[index];
+  }
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    if (/\b(can you|could you|would you|which|what|where|when|how|do you)\b/i.test(lines[index])) {
+      return lines[index];
+    }
+  }
+
+  const sentences = cleaned
+    .split(/(?<=[.?!])\s+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+  for (let index = sentences.length - 1; index >= 0; index -= 1) {
+    if (/\?$/.test(sentences[index])) return sentences[index];
+  }
+
+  return "";
+}
+
+function extractQuestionOptions(text) {
+  const cleaned = String(text || "").replace(/\r/g, "").replace(/\\n/g, "\n").trim();
+  if (!cleaned) return [];
+
+  const rawLines = cleaned
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const options = [];
+  for (const line of rawLines) {
+    const bulletMatch = line.match(/^[-*•]\s+(.{2,180})$/);
+    if (bulletMatch?.[1]) {
+      options.push(bulletMatch[1].trim());
+      continue;
+    }
+
+    const numberedMatch = line.match(/^(?:\d{1,2}[.)]|[A-Da-d][.)])\s+(.{2,180})$/);
+    if (numberedMatch?.[1]) {
+      options.push(numberedMatch[1].trim());
+      continue;
+    }
+
+    const pipeMatch = line.match(/^\s*(?:option\s+)?[A-Da-d]\s*[:\-]\s*(.{2,180})$/i);
+    if (pipeMatch?.[1]) {
+      options.push(pipeMatch[1].trim());
+    }
+  }
+
+  const deduped = [];
+  const seen = new Set();
+  for (const option of options) {
+    const normalized = option.toLowerCase();
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(option.slice(0, 140));
+    if (deduped.length >= 6) break;
+  }
+
+  return deduped;
+}
+
+function extractQuestionFromSerializedPayload(text) {
+  const candidate = String(text || "");
+  if (!candidate) return "";
+  const match = candidate.match(/"question"\s*:\s*"([^"]{3,260})"/i);
+  if (!match?.[1]) return "";
+  return unescapeJsonText(match[1]).slice(0, 220);
+}
+
+function extractQuestionOptionsFromSerializedPayload(text) {
+  const candidate = String(text || "");
+  if (!candidate) return [];
+  const matches = [...candidate.matchAll(/"label"\s*:\s*"([^"]{1,180})"/gi)];
+  if (!matches.length) return [];
+
+  const deduped = [];
+  const seen = new Set();
+  for (const match of matches) {
+    const value = unescapeJsonText(String(match[1] || "").trim());
+    if (!value) continue;
+    const normalized = value.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(value.slice(0, 140));
+    if (deduped.length >= 6) break;
+  }
+
+  return deduped;
+}
+
+function unescapeJsonText(value) {
+  const raw = String(value || "");
+  return raw
+    .replace(/\\"/g, "\"")
+    .replace(/\\n/g, "\n")
+    .replace(/\\t/g, "\t")
+    .trim();
+}
+
+function extractAskUserQuestionPayload(payload) {
+  if (!payload || typeof payload !== "object") return null;
+
+  const candidates = [];
+
+  if (payload.type === "assistant" && payload.message && typeof payload.message === "object") {
+    const content = Array.isArray(payload.message.content) ? payload.message.content : [];
+    for (const item of content) {
+      if (!item || typeof item !== "object") continue;
+      if (String(item.type || "").trim().toLowerCase() !== "tool_use") continue;
+      if (String(item.name || "").trim() !== "AskUserQuestion") continue;
+      candidates.push(item.input || null);
+    }
+  }
+
+  if (payload.type === "item.completed" && payload.item && typeof payload.item === "object") {
+    const itemType = String(payload.item.type || "").trim().toLowerCase();
+    if (itemType === "tool_use" && String(payload.item.name || "").trim() === "AskUserQuestion") {
+      candidates.push(payload.item.input || null);
+    }
+  }
+
+  if (payload.type === "response_item" && payload.payload && typeof payload.payload === "object") {
+    const payloadType = String(payload.payload.type || "").trim().toLowerCase();
+    if (payloadType === "tool_use" && String(payload.payload.name || "").trim() === "AskUserQuestion") {
+      candidates.push(payload.payload.input || null);
+    }
+  }
+
+  if (payload.type === "result" && Array.isArray(payload.permission_denials)) {
+    for (const denial of payload.permission_denials) {
+      if (!denial || typeof denial !== "object") continue;
+      if (String(denial.tool_name || "").trim() !== "AskUserQuestion") continue;
+      candidates.push(denial.tool_input || null);
+    }
+  }
+
+  for (const input of candidates) {
+    const parsed = parseAskUserQuestionInput(input);
+    if (parsed) return parsed;
+  }
+
+  return null;
+}
+
+function parseAskUserQuestionInput(input) {
+  if (!input || typeof input !== "object") return null;
+  const questions = Array.isArray(input.questions) ? input.questions : [];
+  if (questions.length === 0) return null;
+
+  const first = questions.find((item) => item && typeof item === "object") || null;
+  if (!first) return null;
+
+  const question = String(first.question || first.prompt || "").trim();
+  if (!question) return null;
+
+  const options = Array.isArray(first.options)
+    ? first.options
+        .map((option) => {
+          if (typeof option === "string") return option.trim();
+          if (!option || typeof option !== "object") return "";
+          const label = String(option.label || "").trim();
+          const description = String(option.description || "").trim();
+          if (label && description) return `${label} — ${description}`.slice(0, 180);
+          return label || description;
+        })
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+
+  return {
+    question: question.slice(0, 220),
+    options
+  };
+}
+
+function extractToolHintFromPayload(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  const type = String(payload.type || "").trim().toLowerCase();
+
+  if (type === "item.completed" && payload.item && typeof payload.item === "object") {
+    const itemType = String(payload.item.type || "").trim().toLowerCase();
+    if (itemType.includes("tool") || itemType.includes("function") || itemType.includes("call")) {
+      return formatToolHint(payload.item);
+    }
+  }
+
+  if (type === "response_item" && payload.payload && typeof payload.payload === "object") {
+    const itemType = String(payload.payload.type || "").trim().toLowerCase();
+    if (itemType.includes("tool") || itemType.includes("function") || itemType.includes("call")) {
+      return formatToolHint(payload.payload);
+    }
+  }
+
+  if (type === "event_msg" && payload.payload && typeof payload.payload === "object") {
+    const payloadType = String(payload.payload.type || "").trim().toLowerCase();
+    if (payloadType.includes("tool") || payloadType.includes("function") || payloadType.includes("call")) {
+      return formatToolHint(payload.payload);
+    }
+  }
+
+  return "";
+}
+
+function formatToolHint(toolPayload) {
+  if (!toolPayload || typeof toolPayload !== "object") return "";
+  const toolName =
+    String(toolPayload.name || toolPayload.tool_name || toolPayload.toolName || toolPayload.function?.name || "")
+      .trim()
+      .slice(0, 60);
+  const summary = extractStructuredText(toolPayload.text || toolPayload.message || toolPayload.summary || "");
+  if (toolName && summary) {
+    return `${toolName}: ${summary.slice(0, 120)}`;
+  }
+  if (toolName) return toolName;
+  return summary.slice(0, 120);
+}
+
+function extractToolNameFromHint(hint) {
+  const value = String(hint || "").trim();
+  if (!value) return "";
+  const match = value.match(/^([^:]+):/);
+  if (match?.[1]) return match[1].trim();
+  return value.slice(0, 60);
 }
 
 function applyUsageFromRecord(record) {
@@ -539,7 +944,7 @@ function safeFloat(value, fallback) {
 }
 
 function printUsageAndExit(code) {
-  console.log(`Usage:\n  node scripts/agent-runner.mjs [options] -- <command> [args...]\n\nOptions:\n  --agent CODEX|CLAUDE\n  --session <session-id>\n  --title <display-title>\n  --repo <repo-name>\n  --branch <branch-name>\n  --bridge <bridge-url>\n  --fullWorkspaceAccess\n  --skipPermissions\n  --planMode\n  --promptTokens <n>\n  --completionTokens <n>\n  --totalTokens <n>\n  --costUsd <n>\n`);
+  console.log(`Usage:\n  node scripts/agent-runner.mjs [options] -- <command> [args...]\n\nOptions:\n  --agent CODEX|CLAUDE\n  --session <session-id>\n  --run <run-id>\n  --title <display-title>\n  --repo <repo-name>\n  --branch <branch-name>\n  --bridge <bridge-url>\n  --fullWorkspaceAccess\n  --skipPermissions\n  --planMode\n  --promptTokens <n>\n  --completionTokens <n>\n  --totalTokens <n>\n  --costUsd <n>\n`);
   process.exit(code);
 }
 

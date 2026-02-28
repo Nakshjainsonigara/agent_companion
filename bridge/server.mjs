@@ -20,6 +20,9 @@ const MAX_LAUNCHER_RUN_OUTPUT_LINES = 80;
 const MAX_LAUNCHER_RUNS = 150;
 const MAX_CHAT_TURNS = 4000;
 const MAX_TRANSCRIPT_SEGMENTS_PER_RUN = 220;
+const RUN_OUTPUT_TOUCH_INTERVAL_MS = 1200;
+const DIRECT_PENDING_STALE_MS = 90_000;
+const DIRECT_EVENT_STALE_MS = 2 * 60 * 60 * 1000;
 const MAX_MANAGED_SERVICES = 120;
 const MAX_MANAGED_SERVICE_OUTPUT_LINES = 180;
 
@@ -57,6 +60,7 @@ function withPersist(mutator) {
   mutator();
   state = {
     ...state,
+    updatedAt: Date.now(),
     sessions: state.sessions
       .slice()
       .sort((a, b) => b.lastUpdated - a.lastUpdated),
@@ -550,7 +554,11 @@ function findLastTurnForSession(sessionId) {
 function findMatchingSessionId(agentType, workspacePath, repo, title) {
   const lookupKey = buildSessionThreadLookupKey({ agentType, workspacePath, repo, title });
   const matchedThread = findLatestSessionThreadByLookupKey(lookupKey);
-  if (matchedThread?.id) {
+  if (
+    matchedThread?.id &&
+    !String(matchedThread.id).startsWith("codex:") &&
+    !String(matchedThread.id).startsWith("claude:")
+  ) {
     return matchedThread.id;
   }
 
@@ -564,6 +572,7 @@ function findMatchingSessionId(agentType, workspacePath, repo, title) {
 
   for (const session of sorted) {
     if (!session || session.agentType !== agentType) continue;
+    if (String(session.id).startsWith("codex:") || String(session.id).startsWith("claude:")) continue;
     if (normalizeLookupText(session.repo) !== normalizedRepo) continue;
     if (normalizeLookupText(session.title) !== normalizedTitle) continue;
     return String(session.id || "");
@@ -576,6 +585,59 @@ function findActiveRunForSession(sessionId) {
   return [...launcherRuns.values()]
     .sort((a, b) => b.createdAt - a.createdAt)
     .find((run) => run.sessionId === sessionId && (run.status === "RUNNING" || run.status === "STARTING")) || null;
+}
+
+function findLatestRunForSession(sessionId) {
+  return [...launcherRuns.values()]
+    .sort((a, b) => b.createdAt - a.createdAt)
+    .find((run) => run.sessionId === sessionId) || null;
+}
+
+function extractCodexThreadIdFromRun(run) {
+  const direct = safeTrimmedText(run?.codexThreadId, 120);
+  if (direct) return direct.toLowerCase();
+
+  const resume = safeTrimmedText(run?.resumeCommand, 400);
+  if (resume) {
+    const match = resume.match(/codex(?:\s+exec)?\s+resume\s+([0-9a-f-]+)/i);
+    if (match?.[1]) return match[1].toLowerCase();
+  }
+
+  return "";
+}
+
+function extractClaudeSessionIdFromRun(run) {
+  const direct = safeTrimmedText(run?.claudeSessionId, 120).toLowerCase();
+  if (direct) return direct;
+
+  const resume = safeTrimmedText(run?.resumeCommand, 400);
+  if (resume) {
+    const match =
+      resume.match(/claude(?:\s+code)?\s+--resume\s+([0-9a-f-]{36})/i) ||
+      resume.match(/claude(?:\s+code)?\s+-r\s+([0-9a-f-]{36})/i);
+    if (match?.[1]) return match[1].toLowerCase();
+  }
+
+  return "";
+}
+
+function buildContinueCommandFromRun(run, prompt) {
+  const safePrompt = safeTrimmedText(prompt, 1500);
+  if (!safePrompt || !run) return null;
+
+  if (run.agentType === "CODEX") {
+    const threadId = extractCodexThreadIdFromRun(run);
+    if (threadId) {
+      return ["codex", "exec", "resume", threadId, safePrompt];
+    }
+    return ["codex", "exec", safePrompt];
+  }
+
+  const claudeSessionId = extractClaudeSessionIdFromRun(run);
+  if (claudeSessionId) {
+    return ["claude", "--resume", claudeSessionId, "-p", safePrompt, "--output-format", "stream-json"];
+  }
+  return ["claude", "-p", safePrompt, "--output-format", "stream-json"];
 }
 
 function writeToRunStdin(run, message) {
@@ -911,7 +973,8 @@ function createLauncherRun(input) {
       error: "planMode cannot be combined with fullWorkspaceAccess or skipPermissions"
     };
   }
-  const effectivePrompt = planMode ? buildPlanPrompt(input?.prompt) : safeTrimmedText(input?.prompt, 1500);
+  const displayPrompt = safeTrimmedText(input?.prompt, 1500);
+  const effectivePrompt = planMode ? buildPlanPrompt(displayPrompt) : displayPrompt;
   const command = normalizeCommandList(input?.command, agentType, effectivePrompt);
   if (!command || command.length === 0) {
     return { error: "prompt is required when command is not provided" };
@@ -920,7 +983,7 @@ function createLauncherRun(input) {
   const workspaceMeta = detectWorkspaceMeta(workspacePath);
   const title =
     safeTrimmedText(input?.title, 140) ||
-    safeTrimmedText(effectivePrompt || input?.prompt, 140) ||
+    safeTrimmedText(displayPrompt, 140) ||
     `${agentType} local task`;
   const threadLookupKey = buildSessionThreadLookupKey({
     agentType,
@@ -945,7 +1008,8 @@ function createLauncherRun(input) {
     threadLookupKey,
     agentType,
     title,
-    prompt: effectivePrompt || safeTrimmedText(input?.prompt, 1500),
+    prompt: displayPrompt,
+    executionPrompt: effectivePrompt,
     workspacePath,
     repo: workspaceMeta.repo,
     branch: workspaceMeta.branch,
@@ -983,7 +1047,7 @@ function createLauncherRun(input) {
     if (run.launchOptions.newThread) launchMode.push("new-thread");
     const launchSuffix = launchMode.length > 0 ? ` (${launchMode.join(", ")})` : "";
     const reuseSuffix = reusedExistingSession ? " [reused existing session]" : "";
-    const promptTokens = run.prompt ? safeInt(run.prompt.length / 4, 0) : 0;
+    const promptTokens = run.executionPrompt ? safeInt(run.executionPrompt.length / 4, 0) : 0;
     const now = Date.now();
 
     upsertSession({
@@ -1048,6 +1112,8 @@ function createLauncherRun(input) {
     run.agentType,
     "--session",
     run.sessionId,
+    "--run",
+    run.id,
     "--title",
     run.title,
     "--repo",
@@ -1275,18 +1341,54 @@ function extractAssistantSegmentsFromJson(payload) {
   }
 
   if (payload.type === "item.completed" && payload.item && typeof payload.item === "object") {
-    if (payload.item.type === "agent_message") {
+    const itemType = safeTrimmedText(payload.item.type, 80).toLowerCase();
+    if (itemType === "agent_message" || itemType === "message") {
       return extractTextFromContent(payload.item.text || payload.item.content);
+    }
+    if (itemType.includes("tool") || itemType.includes("function") || itemType.includes("call")) {
+      const toolName =
+        safeTrimmedText(payload.item.name, 120) ||
+        safeTrimmedText(payload.item.tool_name, 120) ||
+        safeTrimmedText(payload.item.toolName, 120) ||
+        safeTrimmedText(payload.item.function?.name, 120);
+      const toolStatus = safeTrimmedText(payload.item.status, 40);
+      const header = `[tool] ${toolName || "call"}${toolStatus ? ` (${toolStatus})` : ""}`;
+      const details = extractTextFromContent(payload.item.text || payload.item.content || payload.item.output);
+      return details.length > 0 ? [header, ...details] : [header];
     }
   }
 
-  if (payload.type === "event_msg" && payload.payload && payload.payload.type === "agent_message") {
-    return extractTextFromContent(payload.payload.message || payload.payload.content);
+  if (payload.type === "event_msg" && payload.payload && typeof payload.payload === "object") {
+    const payloadType = safeTrimmedText(payload.payload.type, 80).toLowerCase();
+    if (payloadType === "agent_message" || payloadType === "message") {
+      return extractTextFromContent(payload.payload.message || payload.payload.content);
+    }
+    if (payloadType.includes("tool") || payloadType.includes("function") || payloadType.includes("call")) {
+      const toolName =
+        safeTrimmedText(payload.payload.name, 120) ||
+        safeTrimmedText(payload.payload.tool_name, 120) ||
+        safeTrimmedText(payload.payload.toolName, 120) ||
+        safeTrimmedText(payload.payload.function?.name, 120);
+      const header = `[tool] ${toolName || "call"}`;
+      const details = extractTextFromContent(payload.payload.message || payload.payload.content || payload.payload.output);
+      return details.length > 0 ? [header, ...details] : [header];
+    }
   }
 
-  if (payload.type === "response_item" && payload.payload && payload.payload.type === "message") {
-    if (payload.payload.role === "assistant") {
+  if (payload.type === "response_item" && payload.payload && typeof payload.payload === "object") {
+    const payloadType = safeTrimmedText(payload.payload.type, 80).toLowerCase();
+    if (payloadType === "message" && payload.payload.role === "assistant") {
       return extractTextFromContent(payload.payload.content || payload.payload.message || payload.payload.text);
+    }
+    if (payloadType.includes("tool") || payloadType.includes("function") || payloadType.includes("call")) {
+      const toolName =
+        safeTrimmedText(payload.payload.name, 120) ||
+        safeTrimmedText(payload.payload.tool_name, 120) ||
+        safeTrimmedText(payload.payload.toolName, 120) ||
+        safeTrimmedText(payload.payload.function?.name, 120);
+      const header = `[tool] ${toolName || "call"}`;
+      const details = extractTextFromContent(payload.payload.output || payload.payload.content || payload.payload.message);
+      return details.length > 0 ? [header, ...details] : [header];
     }
   }
 
@@ -1385,6 +1487,22 @@ function appendRunOutput(run, text) {
   run.outputTail.push(...lines);
   if (run.outputTail.length > MAX_LAUNCHER_RUN_OUTPUT_LINES) {
     run.outputTail = run.outputTail.slice(-MAX_LAUNCHER_RUN_OUTPUT_LINES);
+  }
+
+  const now = Date.now();
+  const previousTouchAt = safeNumber(run.lastSessionTouchAt, 0);
+  if (now - previousTouchAt >= RUN_OUTPUT_TOUCH_INTERVAL_MS) {
+    run.lastSessionTouchAt = now;
+    const session = findSession(run.sessionId);
+    if (session && (session.state === "RUNNING" || session.state === "WAITING_INPUT")) {
+      session.lastUpdated = now;
+      session.progress = Math.max(4, Math.min(99, safeNumber(session.progress, 4)));
+      syncSessionThreadFromSession(session, {
+        updatedAt: now,
+        lastMessageAt: now,
+        lastRunId: run.id
+      });
+    }
   }
 }
 
@@ -1775,25 +1893,24 @@ function mergeDirectSnapshot(snapshot) {
     }
   }
 
-  if (incomingPendingIds.size > 0) {
-    state.pendingInputs = state.pendingInputs.filter((item) => {
-      if (!String(item.id || "").startsWith("pending:")) return true;
-      return incomingPendingIds.has(item.id);
-    });
-  }
+  const now = Date.now();
+  state.pendingInputs = state.pendingInputs.filter((item) => {
+    if (!String(item.id || "").startsWith("pending:")) return true;
+    if (incomingPendingIds.has(item.id)) return true;
+    return now - safeNumber(item.requestedAt, 0) <= DIRECT_PENDING_STALE_MS;
+  });
 
   const incomingDirectEventIds = new Set(
     (Array.isArray(snapshot.events) ? snapshot.events : [])
       .map((item) => item?.id)
       .filter((id) => typeof id === "string")
   );
-  if (incomingDirectEventIds.size > 0) {
-    state.events = state.events.filter((item) => {
-      const id = String(item?.id || "");
-      if (!id.startsWith("event:codex:") && !id.startsWith("event:claude:")) return true;
-      return incomingDirectEventIds.has(id);
-    });
-  }
+  state.events = state.events.filter((item) => {
+    const id = String(item?.id || "");
+    if (!id.startsWith("event:codex:") && !id.startsWith("event:claude:")) return true;
+    if (incomingDirectEventIds.has(id)) return true;
+    return now - safeNumber(item.timestamp, 0) <= DIRECT_EVENT_STALE_MS;
+  });
 
   const existingEvents = new Map(state.events.map((item) => [item.id, item]));
   for (const incoming of Array.isArray(snapshot.events) ? snapshot.events : []) {
@@ -1829,6 +1946,11 @@ function buildBootstrapPayload() {
   return {
     ...state,
     source: "bridge",
+    snapshotVersion: safeNumber(state.updatedAt, Date.now()),
+    runs: [...launcherRuns.values()]
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 80)
+      .map((run) => serializeRun(run)),
     sessionSummaries
   };
 }
@@ -1844,6 +1966,55 @@ function normalizeActionType(value) {
     return "TEXT_REPLY";
   }
   return "";
+}
+
+function resolvePendingKind(pending, latestRun) {
+  const fromMeta = safeTrimmedText(pending?.meta?.kind, 64).toUpperCase();
+  if (fromMeta) return fromMeta;
+  if (safeBoolean(pending?.meta?.planMode, false)) return "PLAN_CONFIRM";
+  if (safeBoolean(latestRun?.launchOptions?.planMode, false)) return "PLAN_CONFIRM";
+  return "RUNTIME_APPROVAL";
+}
+
+function launchFollowUpRun(latestRun, sessionId, promptText, options = {}) {
+  if (!latestRun?.workspacePath) {
+    return { ok: false, error: "missing workspace context for follow-up run" };
+  }
+
+  const followUpPrompt = sanitizeTurnText(promptText || "", 1500);
+  if (!followUpPrompt) {
+    return { ok: false, error: "follow-up prompt is required" };
+  }
+
+  const nextPlanMode = safeBoolean(options?.planMode, safeBoolean(latestRun?.launchOptions?.planMode, false));
+  const nextFullWorkspaceAccess = safeBoolean(
+    options?.fullWorkspaceAccess,
+    safeBoolean(latestRun?.launchOptions?.fullWorkspaceAccess, false)
+  );
+  const nextSkipPermissions = safeBoolean(
+    options?.skipPermissions,
+    safeBoolean(latestRun?.launchOptions?.skipPermissions, false)
+  );
+
+  const command = buildContinueCommandFromRun(latestRun, followUpPrompt);
+  const started = createLauncherRun({
+    agentType: latestRun.agentType,
+    workspacePath: latestRun.workspacePath,
+    prompt: followUpPrompt,
+    title: latestRun.title,
+    sessionId,
+    newThread: false,
+    planMode: nextPlanMode,
+    fullWorkspaceAccess: nextFullWorkspaceAccess,
+    skipPermissions: nextSkipPermissions,
+    command: command || undefined
+  });
+
+  if (!started?.run) {
+    return { ok: false, error: started?.error || "unable to start follow-up run" };
+  }
+
+  return { ok: true, run: started.run };
 }
 
 function applyPendingAction(input) {
@@ -1876,9 +2047,114 @@ function applyPendingAction(input) {
     };
   }
 
-  const actionText = type === "APPROVE" ? "approve\n" : type === "REJECT" ? "reject\n" : `${text}\n`;
+  const latestRun = findLatestRunForSession(sessionId);
+  const pendingKind = resolvePendingKind(pending, latestRun);
+  const isPlanConfirm = pendingKind === "PLAN_CONFIRM";
+  const isQuestionRequest = pendingKind === "QUESTION_REQUEST";
+
+  const questionReplyText =
+    type === "TEXT_REPLY"
+      ? text
+      : type === "APPROVE"
+        ? "Yes, continue."
+        : type === "REJECT"
+          ? "No, do not proceed with that approach."
+          : "";
+  if (isQuestionRequest && !sanitizeTurnText(questionReplyText, 3000)) {
+    return {
+      statusCode: 400,
+      body: {
+        ok: false,
+        error: "text reply is required for question requests",
+        pendingInputId,
+        sessionId
+      }
+    };
+  }
+  const actionText = isQuestionRequest
+    ? `${sanitizeTurnText(questionReplyText, 3000)}\n`
+    : type === "APPROVE"
+      ? "approve\n"
+      : type === "REJECT"
+        ? "reject\n"
+        : `${text}\n`;
   const targetRun = findActiveRunForSession(sessionId);
-  const actionDelivered = writeToRunStdin(targetRun, actionText);
+  let actionDelivered = writeToRunStdin(targetRun, actionText);
+  let actionMode = actionDelivered ? "STDIN" : "NONE";
+  let launchedFollowUpRun = null;
+
+  if (!actionDelivered && isQuestionRequest) {
+    const launched = launchFollowUpRun(latestRun, sessionId, sanitizeTurnText(questionReplyText, 1500), {
+      planMode: safeBoolean(latestRun?.launchOptions?.planMode, false),
+      fullWorkspaceAccess: safeBoolean(latestRun?.launchOptions?.fullWorkspaceAccess, false),
+      skipPermissions: safeBoolean(latestRun?.launchOptions?.skipPermissions, false)
+    });
+    if (launched.ok) {
+      launchedFollowUpRun = launched.run;
+      actionDelivered = true;
+      actionMode = "QUESTION_FOLLOW_UP";
+    }
+  }
+
+  if (!actionDelivered && isPlanConfirm && type === "REJECT") {
+    actionDelivered = true;
+    actionMode = "PLAN_REJECT";
+  }
+
+  if (!actionDelivered && isPlanConfirm && (type === "APPROVE" || (type === "TEXT_REPLY" && text))) {
+    const launched = launchFollowUpRun(
+      latestRun,
+      sessionId,
+      type === "TEXT_REPLY" ? text : "Proceed with implementation based on the approved plan.",
+      {
+        planMode: false
+      }
+    );
+    if (!launched.ok) {
+      return {
+        statusCode: 409,
+        body: {
+          ok: false,
+          error: launched.error || "unable to start follow-up run",
+          delivered: false,
+          pendingInputId,
+          sessionId
+        }
+      };
+    }
+    launchedFollowUpRun = launched.run;
+    actionDelivered = true;
+    actionMode = "PLAN_LAUNCH";
+  }
+
+  if (!actionDelivered && latestRun?.agentType === "CLAUDE") {
+    const fallbackPrompt =
+      type === "APPROVE"
+        ? "Approved. Continue with the task."
+        : type === "REJECT"
+          ? "Rejected. Revise and propose a safer alternative."
+          : text;
+    const launched = launchFollowUpRun(latestRun, sessionId, fallbackPrompt);
+    if (launched.ok) {
+      launchedFollowUpRun = launched.run;
+      actionDelivered = true;
+      actionMode = "CLAUDE_FOLLOW_UP";
+    }
+  }
+
+  if (!actionDelivered) {
+    return {
+      statusCode: 409,
+      body: {
+        ok: false,
+        error: "no active writable agent run for this approval",
+        delivered: false,
+        pendingInputId,
+        sessionId
+      }
+    };
+  }
+
   const now = Date.now();
 
   withPersist(() => {
@@ -1893,7 +2169,11 @@ function applyPendingAction(input) {
       session.lastUpdated = now;
 
       if (type === "REJECT") {
-        session.state = "CANCELLED";
+        if (actionMode === "CLAUDE_FOLLOW_UP" || actionMode === "QUESTION_FOLLOW_UP") {
+          session.state = "RUNNING";
+        } else {
+          session.state = isPlanConfirm ? "COMPLETED" : "CANCELLED";
+        }
       } else {
         session.state = "RUNNING";
         session.progress = Math.min(100, Math.max(0, safeNumber(session.progress, 0) + 3));
@@ -1902,7 +2182,7 @@ function applyPendingAction(input) {
       syncSessionThreadFromSession(session, {
         updatedAt: now,
         lastMessageAt: now,
-        lastRunId: targetRun?.id || null
+        lastRunId: launchedFollowUpRun?.id || targetRun?.id || latestRun?.id || null
       });
     }
 
@@ -1918,28 +2198,50 @@ function applyPendingAction(input) {
       kind: "APPROVAL_ACTION",
       text: turnText,
       createdAt: now,
-      runId: targetRun?.id || null,
+      runId: launchedFollowUpRun?.id || targetRun?.id || null,
       approvalId: pendingInputId,
       source: "APPROVAL"
     });
 
     const summary =
       type === "APPROVE"
-        ? actionDelivered
-          ? "Input approved from phone. Sent to running agent."
-          : "Input approved from phone. Marked as resolved."
+        ? actionMode === "PLAN_LAUNCH"
+          ? "Plan approved from phone. Implementation run started."
+          : actionMode === "QUESTION_FOLLOW_UP"
+            ? "Question answered from phone. Follow-up run started."
+          : actionMode === "CLAUDE_FOLLOW_UP"
+            ? "Approval sent from phone. Claude follow-up run started."
+          : "Input approved from phone. Sent to running agent."
         : type === "REJECT"
-          ? actionDelivered
-            ? "Input rejected from phone. Sent to running agent."
+          ? isPlanConfirm
+            ? "Plan declined from phone."
+            : actionMode === "QUESTION_FOLLOW_UP"
+              ? "Question response sent from phone. Follow-up run started."
+            : actionMode === "CLAUDE_FOLLOW_UP"
+              ? "Rejection sent from phone. Claude follow-up run started."
             : "Input rejected from phone. Session cancelled."
-          : `Text reply from phone${actionDelivered ? " sent to agent" : ""}: ${text || "(empty)"}`;
+        : actionMode === "PLAN_LAUNCH"
+            ? `Plan follow-up started from phone: ${text || "(empty)"}`
+            : actionMode === "QUESTION_FOLLOW_UP"
+              ? `Question reply sent from phone: ${questionReplyText || "(empty)"}`
+            : actionMode === "CLAUDE_FOLLOW_UP"
+              ? `Reply sent from phone. Claude follow-up run started: ${text || "(empty)"}`
+            : `Text reply from phone sent to agent: ${text || "(empty)"}`;
 
     addEvent({ sessionId, summary, category: "ACTION", timestamp: now });
   });
 
   return {
     statusCode: 200,
-    body: { ok: true, delivered: actionDelivered, pendingInputId, sessionId, type }
+    body: {
+      ok: true,
+      delivered: actionMode === "STDIN",
+      resolvedVia: actionMode,
+      launchedRunId: launchedFollowUpRun?.id || null,
+      pendingInputId,
+      sessionId,
+      type
+    }
   };
 }
 
@@ -2038,6 +2340,25 @@ app.post("/api/sessions/:id/messages", (req, res) => {
         updatedAt: now,
         lastMessageAt: now,
         lastRunId: targetRun?.id || null
+      });
+    }
+
+    const questionPending = state.pendingInputs.find((item) => {
+      if (item.sessionId !== sessionId) return false;
+      const kind = safeTrimmedText(item?.meta?.kind, 64).toUpperCase();
+      return kind === "QUESTION_REQUEST";
+    });
+    if (questionPending) {
+      state.pendingInputs = state.pendingInputs.filter((item) => item.id !== questionPending.id);
+      state.pendingHandledAt = {
+        ...(state.pendingHandledAt && typeof state.pendingHandledAt === "object" ? state.pendingHandledAt : {}),
+        [questionPending.id]: now
+      };
+      addEvent({
+        sessionId,
+        summary: "Question answered from phone message.",
+        category: "ACTION",
+        timestamp: now
       });
     }
 
@@ -2357,5 +2678,5 @@ app.listen(PORT, () => {
       const snapshot = collectDirectSnapshot();
       mergeDirectSnapshot(snapshot);
     });
-  }, 3000);
+  }, 8000);
 });

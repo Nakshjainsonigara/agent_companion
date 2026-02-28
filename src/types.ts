@@ -139,9 +139,11 @@ export interface SessionsSnapshot {
   pendingInputs: PendingInput[];
   events: SessionEvent[];
   chatTurns?: ChatTurn[];
+  runs?: LauncherRun[];
   sessionSummaries?: SessionThreadSummary[];
   settings?: SettingsPrefs;
   source?: string;
+  snapshotVersion?: number;
 }
 
 export interface PairingConfig {

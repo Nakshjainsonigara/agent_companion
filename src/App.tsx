@@ -31,6 +31,7 @@ import {
   createWorkspace,
   DEFAULT_CLIENT_CONFIG,
   fetchDeviceStatus,
+  fetchSessionRun,
   fetchSessionRuns,
   fetchSessionsSnapshot,
   fetchWorkspaces,
@@ -165,6 +166,7 @@ function App() {
   const [showArchivedSessions, setShowArchivedSessions] = useState(false);
 
   const [busyActionIds, setBusyActionIds] = useState<string[]>([]);
+  const [pendingReplyDrafts, setPendingReplyDrafts] = useState<Record<string, string>>({});
   const [toast, setToast] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [networkOnline, setNetworkOnline] = useState(navigator.onLine);
@@ -212,6 +214,8 @@ function App() {
   const [isSendingFollowUp, setIsSendingFollowUp] = useState(false);
 
   const conversationEndRef = useRef<HTMLDivElement>(null);
+  const liveRefreshInFlightRef = useRef(false);
+  const liveRefreshSeqRef = useRef(0);
 
   const pairRelayUrl = FIXED_RELAY_URL;
 
@@ -243,54 +247,78 @@ function App() {
     setToast("Pairing expired. Pair again.");
   }, []);
 
-  const refreshSnapshot = useCallback(async () => {
-    if (!pairingConfig) return false;
-    try {
-      const snapshot = await fetchSessionsSnapshot(clientConfig);
-      if (!snapshot) {
-        setBridgeConnected(false);
+  const refreshLiveData = useCallback(
+    async (options?: { force?: boolean }) => {
+      if (!pairingConfig) return false;
+      if (liveRefreshInFlightRef.current && !options?.force) {
         return false;
       }
 
-      setBridgeConnected(true);
-      setSessions((previous) => (areSessionsEquivalent(previous, snapshot.sessions) ? previous : snapshot.sessions));
-      setPendingInputs((previous) =>
-        arePendingInputsEquivalent(previous, snapshot.pendingInputs) ? previous : snapshot.pendingInputs
-      );
-      setEvents((previous) => (areEventsEquivalent(previous, snapshot.events) ? previous : snapshot.events));
-      setChatTurns((previous) => {
-        const merged = mergeChatTurnsFromSnapshot(snapshot.chatTurns ?? [], previous, Date.now());
-        return areChatTurnsEquivalent(previous, merged) ? previous : merged;
-      });
-      if (snapshot.settings) {
-        setSettingsPrefs((previous) => {
-          const merged = { ...previous, ...snapshot.settings };
-          return areSettingsEquivalent(previous, merged) ? previous : merged;
+      liveRefreshInFlightRef.current = true;
+      const requestSeq = liveRefreshSeqRef.current + 1;
+      liveRefreshSeqRef.current = requestSeq;
+      const shouldForceLiveRuns = showSessionDetail || hasActiveRuns;
+      const liveRunsPromise = shouldForceLiveRuns ? fetchSessionRuns(clientConfig) : null;
+
+      try {
+        const snapshot = await fetchSessionsSnapshot(clientConfig);
+        if (requestSeq !== liveRefreshSeqRef.current) {
+          return false;
+        }
+        if (!snapshot) {
+          setBridgeConnected(false);
+          return false;
+        }
+
+        setBridgeConnected(true);
+        setSessions((previous) => (areSessionsEquivalent(previous, snapshot.sessions) ? previous : snapshot.sessions));
+        setPendingInputs((previous) =>
+          arePendingInputsEquivalent(previous, snapshot.pendingInputs) ? previous : snapshot.pendingInputs
+        );
+        setEvents((previous) => (areEventsEquivalent(previous, snapshot.events) ? previous : snapshot.events));
+        setChatTurns((previous) => {
+          const merged = mergeChatTurnsFromSnapshot(snapshot.chatTurns ?? [], previous, Date.now());
+          return areChatTurnsEquivalent(previous, merged) ? previous : merged;
         });
-        if (snapshot.settings.workspaceRoot) {
-          setWorkspaceRootDraft((previous) => previous || snapshot.settings.workspaceRoot);
+
+        if (Array.isArray(snapshot.runs) && !shouldForceLiveRuns) {
+          setLauncherRuns((previous) => (areRunsEquivalent(previous, snapshot.runs ?? []) ? previous : snapshot.runs ?? []));
+        } else {
+          try {
+            const runs = liveRunsPromise ? await liveRunsPromise : await fetchSessionRuns(clientConfig);
+            if (requestSeq !== liveRefreshSeqRef.current) return false;
+            setLauncherRuns((previous) => (areRunsEquivalent(previous, runs) ? previous : runs));
+          } catch (runsError) {
+            if (runsError instanceof TokenExpiredError) {
+              handleTokenExpired();
+              return false;
+            }
+          }
+        }
+
+        if (snapshot.settings) {
+          setSettingsPrefs((previous) => {
+            const merged = { ...previous, ...snapshot.settings };
+            return areSettingsEquivalent(previous, merged) ? previous : merged;
+          });
+          if (snapshot.settings.workspaceRoot) {
+            setWorkspaceRootDraft((previous) => previous || snapshot.settings.workspaceRoot);
+          }
+        }
+        return true;
+      } catch (error) {
+        if (error instanceof TokenExpiredError) {
+          handleTokenExpired();
+        }
+        return false;
+      } finally {
+        if (requestSeq === liveRefreshSeqRef.current) {
+          liveRefreshInFlightRef.current = false;
         }
       }
-      return true;
-    } catch (error) {
-      if (error instanceof TokenExpiredError) {
-        handleTokenExpired();
-      }
-      return false;
-    }
-  }, [pairingConfig, clientConfig, handleTokenExpired]);
-
-  const refreshRuns = useCallback(async () => {
-    if (!pairingConfig) return;
-    try {
-      const runs = await fetchSessionRuns(clientConfig);
-      setLauncherRuns((previous) => (areRunsEquivalent(previous, runs) ? previous : runs));
-    } catch (error) {
-      if (error instanceof TokenExpiredError) {
-        handleTokenExpired();
-      }
-    }
-  }, [pairingConfig, clientConfig, handleTokenExpired]);
+    },
+    [pairingConfig, clientConfig, handleTokenExpired, showSessionDetail, hasActiveRuns]
+  );
 
   useEffect(() => {
     const onOnline = () => setNetworkOnline(true);
@@ -307,39 +335,30 @@ function App() {
     if (!pairingConfig) return;
 
     let cancelled = false;
-    const poll = async () => {
-      const ok = await refreshSnapshot();
+    let timer: number | null = null;
+
+    const loop = async () => {
+      if (cancelled) return;
+      const ok = await refreshLiveData();
       if (!cancelled && !ok) {
         setBridgeConnected(false);
       }
+      if (cancelled) return;
+
+      const delay = showSessionDetail || hasActiveRuns ? 700 : 1800;
+      timer = window.setTimeout(() => {
+        void loop();
+      }, delay);
     };
 
-    void poll();
-    const interval = window.setInterval(() => {
-      void poll();
-    }, showSessionDetail || hasActiveRuns ? 900 : 2400);
-
+    void loop();
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
     };
-  }, [pairingConfig, refreshSnapshot, showSessionDetail, hasActiveRuns]);
-
-  useEffect(() => {
-    if (!pairingConfig) return;
-
-    void refreshRuns();
-    const interval = window.setInterval(
-      () => {
-        void refreshRuns();
-      },
-      showSessionDetail || hasActiveRuns ? 1200 : 12000
-    );
-
-    return () => {
-      window.clearInterval(interval);
-    };
-  }, [pairingConfig, refreshRuns, hasActiveRuns, showSessionDetail]);
+  }, [pairingConfig, refreshLiveData, showSessionDetail, hasActiveRuns]);
 
   useEffect(() => {
     if (pairingConfig?.mode !== "REMOTE") {
@@ -404,9 +423,12 @@ function App() {
       if (prev && visible.some((session) => session.id === prev)) {
         return prev;
       }
+      if (prev && showSessionDetail) {
+        return prev;
+      }
       return visible[0]?.id ?? "";
     });
-  }, [sessions, launcherRuns]);
+  }, [sessions, launcherRuns, showSessionDetail]);
 
   // Auto-scroll conversation to bottom on new messages
   useEffect(() => {
@@ -416,18 +438,22 @@ function App() {
   }, [showSessionDetail, chatTurns.length, launcherRuns.length]);
 
   const visibleSessions = useMemo(() => dedupeSessionList(sessions, launcherRuns), [sessions, launcherRuns]);
+  const reusableSessions = useMemo(
+    () => visibleSessions.filter((session) => !isDirectSessionId(session.id)),
+    [visibleSessions]
+  );
 
   useEffect(() => {
     setRunSessionTargetId((prev) => {
-      if (prev && visibleSessions.some((session) => session.id === prev)) {
+      if (prev && reusableSessions.some((session) => session.id === prev)) {
         return prev;
       }
-      if (selectedSessionId && visibleSessions.some((session) => session.id === selectedSessionId)) {
+      if (selectedSessionId && reusableSessions.some((session) => session.id === selectedSessionId)) {
         return selectedSessionId;
       }
-      return visibleSessions[0]?.id ?? "";
+      return reusableSessions[0]?.id ?? "";
     });
-  }, [visibleSessions, selectedSessionId]);
+  }, [reusableSessions, selectedSessionId]);
 
   useEffect(() => {
     if (!toast) return;
@@ -461,6 +487,18 @@ function App() {
     }
     return map;
   }, [launcherRuns]);
+
+  const sessionRecencyById = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const session of visibleSessions) {
+      map.set(session.id, session.lastUpdated);
+    }
+    for (const run of launcherRuns) {
+      const current = map.get(run.sessionId) ?? 0;
+      map.set(run.sessionId, Math.max(current, getRunUpdatedAt(run)));
+    }
+    return map;
+  }, [visibleSessions, launcherRuns]);
 
   const eventsBySession = useMemo(() => {
     const map = new Map<string, SessionEvent[]>();
@@ -504,11 +542,73 @@ function App() {
     return map;
   }, [pendingInputs]);
 
-  const selectedSession = sessionById.get(selectedSessionId) ?? visibleSessions[0] ?? null;
+  const selectedSession = selectedSessionId
+    ? sessionById.get(selectedSessionId) ?? null
+    : visibleSessions[0] ?? null;
   const selectedSessionRuns = selectedSession ? runsBySession.get(selectedSession.id) ?? [] : [];
   const selectedSessionTurns = selectedSession ? turnsBySession.get(selectedSession.id) ?? [] : [];
   const selectedSessionEvents = selectedSession ? eventsBySession.get(selectedSession.id) ?? [] : [];
   const selectedSessionPending = selectedSession ? pendingBySession.get(selectedSession.id) ?? null : null;
+  const selectedSessionActiveRunId = useMemo(() => {
+    if (!selectedSession || selectedSessionRuns.length === 0) return "";
+    const active = [...selectedSessionRuns]
+      .slice()
+      .reverse()
+      .find((run) => run.status === "STARTING" || run.status === "RUNNING");
+    return active?.id || "";
+  }, [selectedSession, selectedSessionRuns]);
+
+  useEffect(() => {
+    if (!pairingConfig) return;
+    if (!showSessionDetail) return;
+    if (!selectedSessionActiveRunId) return;
+
+    let cancelled = false;
+    let timer: number | null = null;
+
+    const streamPoll = async () => {
+      if (cancelled) return;
+      try {
+        const liveRun = await fetchSessionRun(clientConfig, selectedSessionActiveRunId);
+        if (cancelled || !liveRun) return;
+        setBridgeConnected(true);
+        setLauncherRuns((previous) => {
+          const currentIndex = previous.findIndex((item) => item.id === liveRun.id);
+          if (currentIndex >= 0 && areRunsEquivalent([previous[currentIndex]], [liveRun])) {
+            return previous;
+          }
+
+          const next = [...previous];
+          if (currentIndex >= 0) {
+            next[currentIndex] = liveRun;
+          } else {
+            next.push(liveRun);
+          }
+          next.sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
+          return next;
+        });
+      } catch (error) {
+        if (error instanceof TokenExpiredError) {
+          handleTokenExpired();
+          return;
+        }
+      } finally {
+        if (!cancelled) {
+          timer = window.setTimeout(() => {
+            void streamPoll();
+          }, isRemote ? 420 : 220);
+        }
+      }
+    };
+
+    void streamPoll();
+    return () => {
+      cancelled = true;
+      if (timer !== null) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [pairingConfig, showSessionDetail, selectedSessionActiveRunId, clientConfig, handleTokenExpired, isRemote]);
 
   const buildSessionContinueCommand = useCallback(
     (sessionId: string, prompt: string) => {
@@ -554,8 +654,11 @@ function App() {
       return haystack.includes(sessionsSearchNormalized);
     });
 
-    return list.sort((a, b) => b.lastUpdated - a.lastUpdated);
-  }, [visibleSessions, sessionAgentFilter, sessionStatusFilter, sessionsSearchNormalized]);
+    return list.sort(
+      (a, b) =>
+        (sessionRecencyById.get(b.id) ?? b.lastUpdated) - (sessionRecencyById.get(a.id) ?? a.lastUpdated)
+    );
+  }, [visibleSessions, sessionAgentFilter, sessionStatusFilter, sessionsSearchNormalized, sessionRecencyById]);
 
   const sectionActive = filteredSessions.filter((session) => session.state === "RUNNING");
   const sectionWaiting = filteredSessions.filter((session) => session.state === "WAITING_INPUT");
@@ -577,6 +680,7 @@ function App() {
     () => [...launcherRuns].sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a)),
     [launcherRuns]
   );
+  const primaryRuns = useMemo(() => collapseRunsBySession(recentRuns), [recentRuns]);
 
   const conversationRows = useMemo(
     () => buildConversationRows(selectedSessionRuns, selectedSessionTurns, selectedSessionEvents),
@@ -674,22 +778,28 @@ function App() {
   const triggerRefresh = () => {
     setIsRefreshing(true);
     void (async () => {
-      await Promise.all([refreshSnapshot(), refreshRuns()]);
+      await refreshLiveData({ force: true });
       setIsRefreshing(false);
       setToast("Updated");
     })();
   };
 
-  const applyLocalActionState = (pending: PendingInput, type: ActionType, text?: string) => {
+  const applyLocalActionState = (pending: PendingInput, type: ActionType, text?: string, resolvedVia?: string) => {
     setPendingInputs((prev) => prev.filter((item) => item.id !== pending.id));
 
     setSessions((prev) =>
       prev.map((session) => {
         if (session.id !== pending.sessionId) return session;
         if (type === "REJECT") {
+          const nextState: SessionState =
+            resolvedVia === "PLAN_REJECT"
+              ? "COMPLETED"
+              : resolvedVia === "CLAUDE_FOLLOW_UP"
+                ? "RUNNING"
+                : "CANCELLED";
           return {
             ...session,
-            state: "CANCELLED",
+            state: nextState,
             lastUpdated: Date.now(),
           };
         }
@@ -703,12 +813,15 @@ function App() {
       })
     );
 
-    const summary =
-      type === "APPROVE"
-        ? "Approval sent from phone."
-        : type === "REJECT"
-          ? "Rejected from phone."
-          : `Reply sent from phone: ${text?.trim() || "(empty)"}`;
+    const summary = type === "APPROVE"
+      ? resolvedVia === "PLAN_LAUNCH"
+        ? "Plan approved from phone. Implementation run started."
+        : "Approval sent from phone."
+      : type === "REJECT"
+        ? resolvedVia === "PLAN_REJECT"
+          ? "Plan declined from phone."
+          : "Rejected from phone."
+        : `Reply sent from phone: ${text?.trim() || "(empty)"}`;
 
     setEvents((prev) => [
       ...prev,
@@ -740,7 +853,7 @@ function App() {
 
     void (async () => {
       try {
-        const ok = await submitBridgeAction(clientConfig, {
+        const result = await submitBridgeAction(clientConfig, {
           pendingInputId: pending.id,
           sessionId: pending.sessionId,
           type,
@@ -749,13 +862,23 @@ function App() {
 
         setBusyActionIds((prev) => prev.filter((id) => id !== pending.id));
 
-        if (!ok) {
+        if (!result?.ok) {
           setToast("Action failed");
           return;
         }
 
-        applyLocalActionState(pending, type, text);
-        setToast(type === "REJECT" ? "Rejected" : type === "APPROVE" ? "Approved" : "Reply sent");
+        applyLocalActionState(pending, type, text, result.resolvedVia);
+
+        if (result.resolvedVia === "PLAN_LAUNCH") {
+          setToast("Plan approved. Implementation started");
+        } else if (result.resolvedVia === "PLAN_REJECT") {
+          setToast("Plan declined");
+        } else if (result.resolvedVia === "CLAUDE_FOLLOW_UP") {
+          setToast(type === "APPROVE" ? "Approval sent. Claude resumed" : "Reply sent. Claude resumed");
+        } else {
+          setToast(type === "REJECT" ? "Rejected" : type === "APPROVE" ? "Approved" : "Reply sent");
+        }
+        void refreshLiveData({ force: true });
       } catch (error) {
         setBusyActionIds((prev) => prev.filter((id) => id !== pending.id));
         if (error instanceof TokenExpiredError) {
@@ -765,6 +888,24 @@ function App() {
         setToast("Action failed");
       }
     })();
+  };
+
+  const updatePendingReplyDraft = (pendingId: string, value: string) => {
+    setPendingReplyDrafts((previous) => ({ ...previous, [pendingId]: value }));
+  };
+
+  const submitPendingReply = (pending: PendingInput) => {
+    const draft = String(pendingReplyDrafts[pending.id] || "").trim();
+    if (!draft) {
+      setToast("Type a reply first");
+      return;
+    }
+    handleAction(pending, "TEXT_REPLY", draft);
+    setPendingReplyDrafts((previous) => {
+      const next = { ...previous };
+      delete next[pending.id];
+      return next;
+    });
   };
 
   const handleSaveWorkspaceRoot = () => {
@@ -871,6 +1012,74 @@ function App() {
       return;
     }
 
+    if (shouldReuse && isDirectSessionId(targetSessionId)) {
+      setToast("Direct local sessions cannot be reused from Run. Use New Chat.");
+      setIsLaunching(false);
+      return;
+    }
+
+    const launchNow = Date.now();
+    const optimisticRunId = `optimistic_run_${launchNow}_${Math.floor(Math.random() * 1000)}`;
+    const optimisticSessionId = shouldReuse
+      ? targetSessionId
+      : `optimistic_session_${launchNow}_${Math.floor(Math.random() * 1000)}`;
+    const optimisticTitle = runTitle.trim() || launchPrompt.slice(0, 120) || `${runAgentType} local task`;
+    const optimisticRun: LauncherRun = {
+      id: optimisticRunId,
+      sessionId: optimisticSessionId,
+      agentType: runAgentType,
+      title: optimisticTitle,
+      prompt: launchPrompt,
+      workspacePath: runWorkspace.path,
+      repo: runWorkspace.name || "workspace",
+      branch: "main",
+      command: shouldReuse && targetSessionId ? buildSessionContinueCommand(targetSessionId, launchPrompt) : undefined,
+      status: "STARTING",
+      createdAt: launchNow,
+      startedAt: null,
+      endedAt: null,
+      pid: null,
+      exitCode: null,
+      signal: null,
+      error: null,
+      stopRequested: false,
+      outputTail: [],
+      fullWorkspaceAccess: runFullAccess || undefined,
+      planMode: runPlanMode || undefined,
+    };
+
+    setLauncherRuns((previous) => {
+      const next = [...previous.filter((item) => item.id !== optimisticRunId), optimisticRun];
+      next.sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
+      return next;
+    });
+    if (!shouldReuse) {
+      setSessions((previous) => {
+        if (previous.some((session) => session.id === optimisticSessionId)) {
+          return previous;
+        }
+        return [
+          {
+            id: optimisticSessionId,
+            agentType: runAgentType,
+            title: optimisticTitle,
+            repo: runWorkspace.name || "workspace",
+            branch: "main",
+            state: "RUNNING",
+            lastUpdated: launchNow,
+            progress: 2,
+            tokenUsage: {
+              promptTokens: 0,
+              completionTokens: 0,
+              totalTokens: 0,
+              costUsd: 0,
+            },
+          },
+          ...previous,
+        ];
+      });
+    }
+
     void (async () => {
       try {
         const run = await launchTask(clientConfig, {
@@ -888,6 +1097,10 @@ function App() {
         setIsLaunching(false);
 
         if (!run) {
+          setLauncherRuns((previous) => previous.filter((item) => item.id !== optimisticRunId));
+          if (!shouldReuse) {
+            setSessions((previous) => previous.filter((session) => session.id !== optimisticSessionId));
+          }
           setToast("Launch failed");
           return;
         }
@@ -899,10 +1112,58 @@ function App() {
         setSelectedSessionId(run.sessionId);
         setRunSessionTargetId(run.sessionId);
 
-        await Promise.all([refreshRuns(), refreshSnapshot()]);
+        setLauncherRuns((previous) => {
+          const next = [...previous.filter((item) => item.id !== run.id && item.id !== optimisticRunId), run];
+          next.sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
+          return next;
+        });
+        setSessions((previous) => {
+          const sanitized = previous.filter((session) => session.id !== optimisticSessionId);
+          const now = Date.now();
+          const existing = sanitized.find((session) => session.id === run.sessionId);
+          const nextSession: AgentSession = existing
+            ? {
+                ...existing,
+                agentType: run.agentType,
+                title: run.title || existing.title,
+                repo: run.repo || existing.repo,
+                branch: run.branch || existing.branch,
+                state: "RUNNING",
+                progress: Math.max(existing.progress, 4),
+                lastUpdated: Math.max(existing.lastUpdated, getRunUpdatedAt(run), now),
+              }
+            : {
+                id: run.sessionId,
+                agentType: run.agentType,
+                title: run.title || run.prompt || "Untitled session",
+                repo: run.repo || "unknown-repo",
+                branch: run.branch || "main",
+                state: "RUNNING",
+                progress: 4,
+                lastUpdated: Math.max(getRunUpdatedAt(run), now),
+                tokenUsage: {
+                  promptTokens: 0,
+                  completionTokens: 0,
+                  totalTokens: 0,
+                  costUsd: 0,
+                },
+              };
+
+          if (!existing) {
+            return [nextSession, ...sanitized];
+          }
+
+          return sanitized.map((session) => (session.id === run.sessionId ? nextSession : session));
+        });
+
+        void refreshLiveData({ force: true });
         setToast(shouldReuse ? "Continued session" : "New chat started");
       } catch (error) {
         setIsLaunching(false);
+        setLauncherRuns((previous) => previous.filter((item) => item.id !== optimisticRunId));
+        if (!shouldReuse) {
+          setSessions((previous) => previous.filter((session) => session.id !== optimisticSessionId));
+        }
         if (error instanceof TokenExpiredError) {
           handleTokenExpired();
           return;
@@ -921,7 +1182,7 @@ function App() {
           return;
         }
         setToast("Stop requested");
-        await refreshRuns();
+        await refreshLiveData({ force: true });
       } catch (error) {
         if (error instanceof TokenExpiredError) {
           handleTokenExpired();
@@ -988,7 +1249,7 @@ function App() {
 
             if (sent?.ok && sent.delivered) {
               setIsSendingFollowUp(false);
-              void refreshSnapshot();
+              void refreshLiveData({ force: true });
               setToast("Follow-up sent");
               return;
             }
@@ -1026,9 +1287,20 @@ function App() {
           next.sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
           return next;
         });
+        setSessions((prev) =>
+          prev.map((session) =>
+            session.id === run.sessionId
+              ? {
+                  ...session,
+                  state: "RUNNING",
+                  lastUpdated: Math.max(session.lastUpdated, getRunUpdatedAt(run)),
+                  progress: Math.max(session.progress, 10),
+                }
+              : session
+          )
+        );
 
-        void refreshRuns();
-        void refreshSnapshot();
+        void refreshLiveData({ force: true });
         if (!canSendToActiveRun) {
           setToast("Follow-up sent");
         } else if (fallbackReason === "SEND_FAILED") {
@@ -1178,7 +1450,10 @@ function App() {
               ) : (
                 visibleSessions
                   .slice()
-                  .sort((a, b) => b.lastUpdated - a.lastUpdated)
+                  .sort(
+                    (a, b) =>
+                      (sessionRecencyById.get(b.id) ?? b.lastUpdated) - (sessionRecencyById.get(a.id) ?? a.lastUpdated)
+                  )
                   .slice(0, 5)
                   .map((session) => (
                     <SessionRow
@@ -1200,10 +1475,10 @@ function App() {
 
             <SectionHeader title="Latest Runs" />
             <div className="mt-3 space-y-2">
-              {recentRuns.length === 0 ? (
+              {primaryRuns.length === 0 ? (
                 <EmptyState message="No runs yet." />
               ) : (
-                recentRuns.slice(0, 3).map((run) => (
+                primaryRuns.slice(0, 3).map((run) => (
                   <RunCard key={run.id} run={run} onOpenSession={openSession} onStop={handleStopRun} />
                 ))
               )}
@@ -1237,12 +1512,39 @@ function App() {
                       const session = sessionById.get(pending.sessionId) ?? null;
                       const busy = busyActionIds.includes(pending.id);
                       const actionable = pending.actionable !== false;
+                      const pendingKind = getPendingKind(pending);
+                      const isQuestionRequest = pendingKind === "QUESTION_REQUEST";
+                      const toolLabel = getPendingToolLabel(pending);
+                      const questionOptions = getPendingQuestionOptions(pending);
+                      const replyDraft = String(pendingReplyDrafts[pending.id] || "");
 
                       return (
                         <article key={pending.id} className="rounded-2xl border border-white/[0.06] bg-white/[0.02] px-3 py-3">
                           <div className="flex items-start justify-between gap-3">
                             <div>
                               <p className="text-[12px] font-semibold text-foreground/90">{session?.title ?? pending.sessionId}</p>
+                              <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                                {pendingKind === "TOOL_PERMISSION" && (
+                                  <span className="rounded-full bg-brand-openai/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-brand-openai">
+                                    Tool Call
+                                  </span>
+                                )}
+                                {pendingKind === "PLAN_CONFIRM" && (
+                                  <span className="rounded-full bg-brand-claude/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-brand-claude">
+                                    Plan Confirm
+                                  </span>
+                                )}
+                                {pendingKind === "QUESTION_REQUEST" && (
+                                  <span className="rounded-full bg-amber-400/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-400">
+                                    Question
+                                  </span>
+                                )}
+                                {toolLabel && (
+                                  <span className="rounded-full bg-white/[0.08] px-2 py-0.5 text-[9px] font-medium text-foreground/70">
+                                    {toolLabel}
+                                  </span>
+                                )}
+                              </div>
                               <p className="mt-1 text-[12px] leading-snug text-foreground/70">{pending.prompt}</p>
                             </div>
                             <span
@@ -1259,28 +1561,75 @@ function App() {
                             </span>
                           </div>
 
-                          <div className="mt-3 flex items-center gap-2">
-                            <Button
-                              size="sm"
-                              className="flex-1"
-                              onClick={() => handleAction(pending, "APPROVE")}
-                              disabled={busy || !actionable}
-                            >
-                              Approve
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              className="flex-1"
-                              onClick={() => handleAction(pending, "REJECT")}
-                              disabled={busy || !actionable}
-                            >
-                              Reject
-                            </Button>
-                            <Button size="sm" variant="ghost" onClick={() => openSession(pending.sessionId)}>
-                              Open
-                            </Button>
-                          </div>
+                          {isQuestionRequest ? (
+                            <div className="mt-3 space-y-2">
+                              {questionOptions.length > 0 && (
+                                <div className="flex flex-wrap gap-1.5">
+                                  {questionOptions.map((option) => (
+                                    <button
+                                      key={`${pending.id}:${option}`}
+                                      type="button"
+                                      onClick={() => updatePendingReplyDraft(pending.id, option)}
+                                      disabled={busy || !actionable}
+                                      className="rounded-full border border-amber-400/25 bg-amber-400/[0.08] px-2.5 py-1 text-[10px] text-amber-300 transition hover:bg-amber-400/[0.16] disabled:opacity-35"
+                                    >
+                                      {option}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                              <textarea
+                                rows={2}
+                                value={replyDraft}
+                                onChange={(event) => updatePendingReplyDraft(pending.id, event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Enter" && !event.shiftKey) {
+                                    event.preventDefault();
+                                    submitPendingReply(pending);
+                                  }
+                                }}
+                                placeholder="Type reply for agent..."
+                                className="w-full resize-none rounded-lg border border-white/[0.08] bg-white/[0.03] px-2.5 py-2 text-[12px] text-foreground placeholder:text-muted-foreground/35 focus:border-brand-openai/30 focus:outline-none"
+                                disabled={busy || !actionable}
+                              />
+                              <div className="flex items-center gap-2">
+                                <Button
+                                  size="sm"
+                                  className="flex-1"
+                                  onClick={() => submitPendingReply(pending)}
+                                  disabled={busy || !actionable || !replyDraft.trim()}
+                                >
+                                  Send Reply
+                                </Button>
+                                <Button size="sm" variant="ghost" onClick={() => openSession(pending.sessionId)}>
+                                  Open
+                                </Button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="mt-3 flex items-center gap-2">
+                              <Button
+                                size="sm"
+                                className="flex-1"
+                                onClick={() => handleAction(pending, "APPROVE")}
+                                disabled={busy || !actionable}
+                              >
+                                Approve
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="flex-1"
+                                onClick={() => handleAction(pending, "REJECT")}
+                                disabled={busy || !actionable}
+                              >
+                                Reject
+                              </Button>
+                              <Button size="sm" variant="ghost" onClick={() => openSession(pending.sessionId)}>
+                                Open
+                              </Button>
+                            </div>
+                          )}
 
                           {!actionable && (
                             <p className="mt-2 text-[11px] text-amber-400/80">This approval is view-only from phone.</p>
@@ -1476,24 +1825,34 @@ function App() {
 
                       {runSessionPickerOpen && (
                         <div className="absolute left-0 right-0 top-full z-10 mt-1 max-h-44 overflow-y-auto rounded-xl border border-white/[0.06] bg-surface">
-                          {sessions
-                            .slice()
-                            .sort((a, b) => b.lastUpdated - a.lastUpdated)
-                            .map((session) => (
-                              <button
-                                key={session.id}
-                                onClick={() => {
-                                  setRunSessionTargetId(session.id);
-                                  setRunSessionPickerOpen(false);
-                                }}
-                                className={cn(
-                                  "w-full truncate px-3 py-2 text-left text-[12px] transition hover:bg-white/[0.04]",
-                                  runSessionTargetId === session.id && "bg-white/[0.04]"
-                                )}
-                              >
-                                {session.title}
-                              </button>
-                            ))}
+                          {reusableSessions.length === 0 ? (
+                            <p className="px-3 py-3 text-[11px] text-muted-foreground/60">
+                              No reusable app sessions yet. Start a New Chat first.
+                            </p>
+                          ) : (
+                            reusableSessions
+                              .slice()
+                              .sort(
+                                (a, b) =>
+                                  (sessionRecencyById.get(b.id) ?? b.lastUpdated) -
+                                  (sessionRecencyById.get(a.id) ?? a.lastUpdated)
+                              )
+                              .map((session) => (
+                                <button
+                                  key={session.id}
+                                  onClick={() => {
+                                    setRunSessionTargetId(session.id);
+                                    setRunSessionPickerOpen(false);
+                                  }}
+                                  className={cn(
+                                    "w-full truncate px-3 py-2 text-left text-[12px] transition hover:bg-white/[0.04]",
+                                    runSessionTargetId === session.id && "bg-white/[0.04]"
+                                  )}
+                                >
+                                  {session.title}
+                                </button>
+                              ))
+                          )}
                         </div>
                       )}
                     </div>
@@ -1589,10 +1948,10 @@ function App() {
                 </div>
 
                 <div className="mt-3 space-y-2">
-                  {recentRuns.length === 0 ? (
+                  {primaryRuns.length === 0 ? (
                     <EmptyState message="No runs yet." />
                   ) : (
-                    recentRuns.map((run) => (
+                    primaryRuns.map((run) => (
                       <RunCard key={run.id} run={run} onOpenSession={openSession} onStop={handleStopRun} />
                     ))
                   )}
@@ -1814,31 +2173,108 @@ function App() {
                     {/* Approval block — TUI style */}
                     {selectedSessionPending && (
                       <div className="mt-3 border-l-2 border-amber-400/40 pl-3 py-2">
-                        <p className="text-[10px] text-amber-400/70">
-                          ⚠ approval required · {formatRelativeTime(selectedSessionPending.requestedAt)}
-                        </p>
-                        <p className="mt-1 text-[12px] leading-snug text-foreground/80">{selectedSessionPending.prompt}</p>
+                        {(() => {
+                          const pendingKind = getPendingKind(selectedSessionPending);
+                          const isQuestionRequest = pendingKind === "QUESTION_REQUEST";
+                          const toolLabel = getPendingToolLabel(selectedSessionPending);
+                          const questionOptions = getPendingQuestionOptions(selectedSessionPending);
+                          const replyDraft = String(pendingReplyDrafts[selectedSessionPending.id] || "");
+                          const busy = busyActionIds.includes(selectedSessionPending.id);
+                          const actionable = selectedSessionPending.actionable !== false;
+                          return (
+                            <>
+                              <div className="mb-1 flex flex-wrap items-center gap-1.5">
+                                {pendingKind === "TOOL_PERMISSION" && (
+                                  <span className="rounded-full bg-brand-openai/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-brand-openai">
+                                    Tool Call
+                                  </span>
+                                )}
+                                {pendingKind === "PLAN_CONFIRM" && (
+                                  <span className="rounded-full bg-brand-claude/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-brand-claude">
+                                    Plan Confirm
+                                  </span>
+                                )}
+                                {pendingKind === "QUESTION_REQUEST" && (
+                                  <span className="rounded-full bg-amber-400/15 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-400">
+                                    Question
+                                  </span>
+                                )}
+                                {toolLabel && (
+                                  <span className="rounded-full bg-white/[0.08] px-2 py-0.5 text-[9px] font-medium text-foreground/70">
+                                    {toolLabel}
+                                  </span>
+                                )}
+                              </div>
+                              <p className="text-[10px] text-amber-400/70">
+                                {isQuestionRequest ? "✎ response needed" : "⚠ approval required"} ·{" "}
+                                {formatRelativeTime(selectedSessionPending.requestedAt)}
+                              </p>
+                              <p className="mt-1 text-[12px] leading-snug text-foreground/80">{selectedSessionPending.prompt}</p>
 
-                        <div className="mt-2 flex gap-2">
-                          <button
-                            disabled={busyActionIds.includes(selectedSessionPending.id) || selectedSessionPending.actionable === false}
-                            onClick={() => handleAction(selectedSessionPending, "APPROVE")}
-                            className="rounded border border-emerald-400/30 bg-emerald-400/[0.06] px-3 py-1 text-[11px] text-emerald-400 transition hover:bg-emerald-400/[0.12] disabled:opacity-30"
-                          >
-                            [y] approve
-                          </button>
-                          <button
-                            disabled={busyActionIds.includes(selectedSessionPending.id) || selectedSessionPending.actionable === false}
-                            onClick={() => handleAction(selectedSessionPending, "REJECT")}
-                            className="rounded border border-rose-400/30 bg-rose-400/[0.06] px-3 py-1 text-[11px] text-rose-400 transition hover:bg-rose-400/[0.12] disabled:opacity-30"
-                          >
-                            [n] reject
-                          </button>
-                        </div>
+                              {isQuestionRequest ? (
+                                <div className="mt-2 space-y-2">
+                                  {questionOptions.length > 0 && (
+                                    <div className="flex flex-wrap gap-1.5">
+                                      {questionOptions.map((option) => (
+                                        <button
+                                          key={`${selectedSessionPending.id}:${option}`}
+                                          type="button"
+                                          disabled={busy || !actionable}
+                                          onClick={() => updatePendingReplyDraft(selectedSessionPending.id, option)}
+                                          className="rounded border border-amber-400/25 bg-amber-400/[0.08] px-2 py-1 text-[10px] text-amber-300 transition hover:bg-amber-400/[0.16] disabled:opacity-35"
+                                        >
+                                          {option}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                  <textarea
+                                    rows={2}
+                                    value={replyDraft}
+                                    onChange={(event) => updatePendingReplyDraft(selectedSessionPending.id, event.target.value)}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" && !event.shiftKey) {
+                                        event.preventDefault();
+                                        submitPendingReply(selectedSessionPending);
+                                      }
+                                    }}
+                                    placeholder="Type reply for agent..."
+                                    disabled={busy || !actionable}
+                                    className="w-full resize-none rounded border border-white/[0.08] bg-white/[0.03] px-2 py-1.5 text-[12px] text-foreground placeholder:text-muted-foreground/35 focus:border-brand-openai/30 focus:outline-none disabled:opacity-40"
+                                  />
+                                  <button
+                                    disabled={busy || !actionable || !replyDraft.trim()}
+                                    onClick={() => submitPendingReply(selectedSessionPending)}
+                                    className="rounded border border-brand-openai/30 bg-brand-openai/[0.08] px-3 py-1 text-[11px] text-brand-openai transition hover:bg-brand-openai/[0.14] disabled:opacity-30"
+                                  >
+                                    [↵] send reply
+                                  </button>
+                                </div>
+                              ) : (
+                                <div className="mt-2 flex gap-2">
+                                  <button
+                                    disabled={busy || !actionable}
+                                    onClick={() => handleAction(selectedSessionPending, "APPROVE")}
+                                    className="rounded border border-emerald-400/30 bg-emerald-400/[0.06] px-3 py-1 text-[11px] text-emerald-400 transition hover:bg-emerald-400/[0.12] disabled:opacity-30"
+                                  >
+                                    [y] approve
+                                  </button>
+                                  <button
+                                    disabled={busy || !actionable}
+                                    onClick={() => handleAction(selectedSessionPending, "REJECT")}
+                                    className="rounded border border-rose-400/30 bg-rose-400/[0.06] px-3 py-1 text-[11px] text-rose-400 transition hover:bg-rose-400/[0.12] disabled:opacity-30"
+                                  >
+                                    [n] reject
+                                  </button>
+                                </div>
+                              )}
 
-                        {selectedSessionPending.actionable === false && (
-                          <p className="mt-1.5 text-[10px] text-amber-400/50">read-only from phone</p>
-                        )}
+                              {selectedSessionPending.actionable === false && (
+                                <p className="mt-1.5 text-[10px] text-amber-400/50">read-only from phone</p>
+                              )}
+                            </>
+                          );
+                        })()}
                       </div>
                     )}
 
@@ -2620,7 +3056,7 @@ function buildConversationRows(runs: LauncherRun[], turns: ChatTurn[], events: S
       if (!rawText) continue;
 
       if (turn.role === "ASSISTANT") {
-        // Strip transient thinking/tool fragments line-by-line
+        // Strip transient thinking fragments line-by-line
         const stableLines = rawText
           .split("\n")
           .filter((l) => !shouldHideRawOutput(l))
@@ -2665,7 +3101,7 @@ function buildConversationRows(runs: LauncherRun[], turns: ChatTurn[], events: S
       .find((run) => run.status === "STARTING" || run.status === "RUNNING");
     if (activeRun) {
       const rawLiveTranscript = getRunAssistantOutput(activeRun);
-      // Strip transient fragments from live transcript too
+      // Strip transient thinking fragments from live transcript too
       const liveTranscript = rawLiveTranscript
         ? rawLiveTranscript
             .split("\n")
@@ -2770,6 +3206,36 @@ function extractSessionPreview(turns: ChatTurn[], runs: LauncherRun[], events: S
 
 function getRunUpdatedAt(run: LauncherRun) {
   return run.endedAt ?? run.startedAt ?? run.createdAt;
+}
+
+function runStatusPriority(status: LauncherRunStatus) {
+  if (status === "RUNNING" || status === "STARTING") return 3;
+  if (status === "FAILED") return 2;
+  if (status === "STOPPED") return 1;
+  return 0;
+}
+
+function collapseRunsBySession(sortedRuns: LauncherRun[]) {
+  const bySession = new Map<string, LauncherRun[]>();
+  for (const run of sortedRuns) {
+    const current = bySession.get(run.sessionId) ?? [];
+    current.push(run);
+    bySession.set(run.sessionId, current);
+  }
+
+  const collapsed: LauncherRun[] = [];
+  for (const list of bySession.values()) {
+    const chosen = [...list].sort((a, b) => {
+      const statusDiff = runStatusPriority(b.status) - runStatusPriority(a.status);
+      if (statusDiff !== 0) return statusDiff;
+      return getRunUpdatedAt(b) - getRunUpdatedAt(a);
+    })[0];
+    if (chosen) {
+      collapsed.push(chosen);
+    }
+  }
+
+  return collapsed.sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
 }
 
 function getRunAssistantOutput(run: LauncherRun) {
@@ -3017,9 +3483,8 @@ function shouldHideRawOutput(line: string) {
   if (!line) return true;
 
   if (line.startsWith("[agent-runner]")) return true;
-  // Hide transient thinking / tool-call fragments
+  // Hide transient thinking fragments
   if (/^\[thinking\]/i.test(line)) return true;
-  if (/^\[tool\]/i.test(line)) return true;
   if (/^\d{4}-\d{2}-\d{2}T/.test(line) && /\b(INFO|WARN|ERROR)\b/.test(line)) return true;
   if (/^(tip:|usage:|for more information, try|warning: term is set)/i.test(line)) return true;
   if (/^prompt[_\s-]*tokens?/i.test(line)) return true;
@@ -3296,6 +3761,12 @@ function areSettingsEquivalent(previous: SettingsPrefs, next: SettingsPrefs) {
 function dedupeSessionList(sessions: AgentSession[], runs: LauncherRun[]) {
   if (!Array.isArray(sessions) || sessions.length === 0) return [];
 
+  const runBoundSessionIds = new Set(
+    (Array.isArray(runs) ? runs : [])
+      .map((run) => run?.sessionId)
+      .filter((id): id is string => Boolean(id))
+  );
+
   const threadToSession = new Map<string, { sessionId: string; updatedAt: number }>();
   for (const run of runs) {
     if (run.agentType !== "CODEX") continue;
@@ -3309,12 +3780,20 @@ function dedupeSessionList(sessions: AgentSession[], runs: LauncherRun[]) {
   }
 
   return sessions.filter((session) => {
-    if (!session.id.startsWith("codex:")) return true;
-    const threadId = session.id.slice("codex:".length).trim().toLowerCase();
-    if (!threadId) return true;
-    const mapped = threadToSession.get(threadId);
-    if (!mapped) return true;
-    return mapped.sessionId === session.id;
+    // Never hide a session that is explicitly referenced by a launcher run.
+    if (runBoundSessionIds.has(session.id)) return true;
+
+    if (session.id.startsWith("codex:")) {
+      const threadId = session.id.slice("codex:".length).trim().toLowerCase();
+      if (threadId) {
+        const mapped = threadToSession.get(threadId);
+        if (mapped && mapped.sessionId !== session.id) {
+          return false;
+        }
+      }
+    }
+
+    return true;
   });
 }
 
@@ -3378,6 +3857,80 @@ function priorityWeight(priority: PendingInput["priority"]) {
   if (priority === "HIGH") return 0;
   if (priority === "MEDIUM") return 1;
   return 2;
+}
+
+function getPendingKind(pending: PendingInput) {
+  const meta = pending?.meta && typeof pending.meta === "object" ? pending.meta : null;
+  const raw = String(meta?.kind || "").trim().toUpperCase();
+  if (raw === "TOOL_PERMISSION") return "TOOL_PERMISSION";
+  if (raw === "PLAN_CONFIRM") return "PLAN_CONFIRM";
+  if (raw === "QUESTION_REQUEST") return "QUESTION_REQUEST";
+  if (meta?.questionRequest === true) return "QUESTION_REQUEST";
+  return "RUNTIME_APPROVAL";
+}
+
+function getPendingToolLabel(pending: PendingInput) {
+  const meta = pending?.meta && typeof pending.meta === "object" ? pending.meta : null;
+  const candidates = [
+    meta?.toolName,
+    meta?.tool,
+    meta?.name,
+    meta?.toolCall,
+  ];
+  for (const item of candidates) {
+    const value = String(item || "").trim();
+    if (!value) continue;
+    return value.slice(0, 40);
+  }
+
+  const prompt = String(pending?.prompt || "").replace(/\\n/g, "\n");
+  const match = prompt.match(/\[tool\]\s*([^\n(]+?)(?:\s*\(|$)/i);
+  if (match?.[1]) {
+    return match[1].trim().slice(0, 40);
+  }
+
+  return "";
+}
+
+function getPendingQuestionOptions(pending: PendingInput) {
+  const meta = pending?.meta && typeof pending.meta === "object" ? pending.meta : null;
+  const direct = Array.isArray(meta?.questionOptions)
+    ? meta.questionOptions
+        .map((item) => String(item || "").trim())
+        .filter(Boolean)
+        .slice(0, 6)
+    : [];
+  if (direct.length > 0) return direct;
+
+  const prompt = String(pending?.prompt || "");
+  const options = prompt
+    .split("\n")
+    .map((line) => line.trim())
+    .map((line) => {
+      const bulletMatch = line.match(/^[-*•]\s+(.{2,180})$/);
+      if (bulletMatch?.[1]) return bulletMatch[1].trim();
+      const numberedMatch = line.match(/^(?:\d{1,2}[.)]|[A-Da-d][.)])\s+(.{2,180})$/);
+      if (numberedMatch?.[1]) return numberedMatch[1].trim();
+      return "";
+    })
+    .filter(Boolean);
+
+  const deduped: string[] = [];
+  const seen = new Set<string>();
+  for (const option of options) {
+    const normalized = option.toLowerCase();
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    deduped.push(option.slice(0, 140));
+    if (deduped.length >= 6) break;
+  }
+
+  return deduped;
+}
+
+function isDirectSessionId(sessionId: string) {
+  const id = String(sessionId || "");
+  return id.startsWith("codex:") || id.startsWith("claude:");
 }
 
 function isLocalRelayUrl(value: string | null | undefined) {

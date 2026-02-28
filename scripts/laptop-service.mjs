@@ -23,6 +23,7 @@ const companionStateFile = trim(args["state-file"]);
 const bridgeToken = trim(args["bridge-token"]) || trim(process.env.AGENT_BRIDGE_TOKEN);
 const wakeMac = trim(args["wake-mac"]) || trim(args.wakeMac) || trim(process.env.AGENT_WAKE_MAC);
 const verbose = toBool(args.verbose) || toBool(process.env.AGENT_VERBOSE);
+const keepAwakeEnabled = !toBool(args["allow-sleep"]) && !toBool(process.env.AGENT_ALLOW_SLEEP);
 
 const bridgeBaseUrl = `http://localhost:${bridgePort}`;
 const childSpecs = [];
@@ -55,6 +56,13 @@ if (withLocalRelay) {
 
 const children = [];
 let shuttingDown = false;
+
+if (keepAwakeEnabled) {
+  const keepAwake = startKeepAwakeProcess({ verbose });
+  if (keepAwake) {
+    children.push({ name: keepAwake.name, child: keepAwake.child });
+  }
+}
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -135,6 +143,51 @@ function attachLogs(name, child) {
     if (Number.isInteger(code) && code === 0) return;
     console.error(`[laptop-service] ${name} exited with code ${code ?? "unknown"}`);
   });
+}
+
+function startKeepAwakeProcess({ verbose }) {
+  if (process.platform === "darwin") {
+    const child = spawn("caffeinate", ["-dimsu"], {
+      cwd: projectRoot,
+      env: process.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+    child.on("error", (error) => {
+      process.stderr.write(`[laptop-service] keep-awake unavailable: ${String(error?.message || error)}\n`);
+    });
+    if (verbose) {
+      attachLogs("keep-awake", child);
+    } else {
+      child.stderr.on("data", () => {
+        // suppress noisy caffeinate stderr in quiet mode
+      });
+    }
+    process.stdout.write("[laptop-service] sleep prevention active (caffeinate)\n");
+    return { name: "keep-awake", child };
+  }
+
+  if (process.platform === "linux") {
+    const child = spawn(
+      "systemd-inhibit",
+      ["--what=sleep", "--why=agent-companion", "--mode=block", "sleep", "infinity"],
+      {
+        cwd: projectRoot,
+        env: process.env,
+        stdio: ["ignore", "pipe", "pipe"]
+      }
+    );
+    child.on("error", (error) => {
+      process.stderr.write(`[laptop-service] keep-awake unavailable: ${String(error?.message || error)}\n`);
+    });
+    if (verbose) {
+      attachLogs("keep-awake", child);
+    }
+    process.stdout.write("[laptop-service] sleep prevention requested (systemd-inhibit)\n");
+    return { name: "keep-awake", child };
+  }
+
+  process.stdout.write("[laptop-service] sleep prevention not supported on this OS; continuing\n");
+  return null;
 }
 
 function shutdown(reason) {
@@ -224,6 +277,7 @@ Options:
   --bridge-port <port>          Bridge port (default: 8787)
   --bridge-token <token>        Optional bridge token
   --wake-mac <mac>              Optional Wake-on-LAN MAC (AA:BB:CC:DD:EE:FF)
+  --allow-sleep                 Disable keep-awake mode
   --name <label>                Laptop display name for pairing
   --state-file <path>           Companion state file path
 `);

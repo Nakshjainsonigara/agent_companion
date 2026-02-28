@@ -6,7 +6,7 @@ const MAX_FILES_PER_PROVIDER = 24;
 const MAX_SESSION_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 const PENDING_FRESH_WINDOW_MS = 7_500;
 const PENDING_PATTERN =
-  /input required|needs input|waiting for input|approval[_\s-]*required|awaiting approval|please approve|approve (?:this|the) plan|should i (?:proceed|implement|execute)|would you like me to (?:proceed|implement|execute)|ready to (?:implement|execute)|want me to (?:implement|execute)/i;
+  /input required|needs input|waiting for input|approval[_\s-]*required|awaiting approval|please approve|approve (?:this|the) plan|should i (?:proceed|implement|execute)|would you like me to (?:proceed|implement|execute)|ready to (?:implement|execute)|want me to (?:implement|execute)|proceed with implementation/i;
 
 export function collectDirectSnapshot(nowMs = Date.now()) {
   const codexSessions = collectCodexSessions(nowMs);
@@ -507,6 +507,8 @@ function isNoisePrompt(text) {
   if (raw.includes("# AGENTS.md instructions")) return true;
   if (raw.includes("<environment_context>")) return true;
   if (raw.includes("Filesystem sandboxing defines")) return true;
+  if (raw.includes("AGENT_COMPANION_PERSIST_SERVER_HINT_V1")) return true;
+  if (raw.includes("[Request interrupted by user for tool use]")) return true;
   return false;
 }
 

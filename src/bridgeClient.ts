@@ -33,7 +33,7 @@ const DEFAULT_RELAY_URL = defaultRelayUrlFromEnv();
 const PAIRING_STORAGE_KEY = "agent_companion_pairing_v1";
 const REMOTE_WAKE_AWARE_TIMEOUT_MS = 95_000;
 const REMOTE_POLL_TIMEOUT_MS = 6_500;
-const REMOTE_MESSAGE_TIMEOUT_MS = 20_000;
+const REMOTE_MESSAGE_TIMEOUT_MS = 8_000;
 
 let bridgeToken: string | null = null;
 
@@ -207,19 +207,22 @@ export async function fetchDeviceStatus(config?: ClientConfig): Promise<RemoteDe
 export async function submitBridgeAction(
   configOrInput: ClientConfig | ActionInput,
   maybeInput?: ActionInput
-): Promise<boolean> {
+): Promise<{ ok: boolean; delivered?: boolean; resolvedVia?: string; launchedRunId?: string | null } | null> {
   const { config, input } = normalizeActionArgs(configOrInput, maybeInput);
   const resolved = resolveClientConfig(config);
 
-  const result = await requestJson<{ ok: boolean }>(resolved, {
-    method: "POST",
-    pathLocal: "/api/actions",
-    pathRemote: devicePath(resolved, "/actions"),
-    timeoutMs: 2200,
-    body: input
-  });
+  const result = await requestJson<{ ok: boolean; delivered?: boolean; resolvedVia?: string; launchedRunId?: string | null }>(
+    resolved,
+    {
+      method: "POST",
+      pathLocal: "/api/actions",
+      pathRemote: devicePath(resolved, "/actions"),
+      timeoutMs: isRemote(resolved) ? REMOTE_MESSAGE_TIMEOUT_MS : 4500,
+      body: input
+    }
+  );
 
-  return result?.ok === true;
+  return result ?? null;
 }
 
 export async function pingBridge(config?: ClientConfig): Promise<boolean> {
