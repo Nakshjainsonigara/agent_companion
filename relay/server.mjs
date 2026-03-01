@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import cors from "cors";
 import express from "express";
-import { randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import fs from "node:fs";
 import { createServer } from "node:http";
 import path from "node:path";
@@ -16,6 +16,7 @@ const RELAY_PORT = toInt(process.env.PORT || process.env.RELAY_PORT, 9797);
 const RELAY_PUBLIC_URL = trimTrailingSlash(
   process.env.RELAY_PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || `http://localhost:${RELAY_PORT}`
 );
+const RELAY_TOKEN_SECRET = resolveRelayTokenSecret();
 const RELAY_WAKE_PROXY_URL = trimTrailingSlash(process.env.RELAY_WAKE_PROXY_URL || process.env.WAKE_PROXY_URL || "");
 const RELAY_WAKE_PROXY_TOKEN = safeText(process.env.RELAY_WAKE_PROXY_TOKEN || process.env.WAKE_PROXY_TOKEN || "", 500);
 const RELAY_WAKE_TIMEOUT_MS = clamp(toInt(process.env.RELAY_WAKE_TIMEOUT_MS, 90_000), 5_000, 5 * 60 * 1000);
@@ -34,6 +35,8 @@ const CLEANUP_INTERVAL_MS = 30_000;
 const MAX_LAPTOP_RECORDS = 500;
 const MAX_PHONE_TOKENS = 2_000;
 const MAX_PREVIEW_RECORDS = 4_000;
+const PHONE_TOKEN_HEADER = "x-agent-companion-phone-token";
+const LAPTOP_TOKEN_HEADER = "x-agent-companion-laptop-token";
 
 const STATE_FILE = path.resolve(PROJECT_ROOT, "relay", "state.json");
 const app = express();
@@ -48,8 +51,16 @@ const laptopSockets = new Map();
 const pendingRpcs = new Map();
 const pendingWakeAttempts = new Map();
 
-app.use(cors());
+app.use(
+  cors({
+    exposedHeaders: [PHONE_TOKEN_HEADER, LAPTOP_TOKEN_HEADER]
+  })
+);
 app.use(express.json({ limit: "2mb" }));
+
+if (!RELAY_TOKEN_SECRET) {
+  console.warn("[relay] durable token secret missing; pairing may break after relay restarts");
+}
 
 app.get("/health", (_req, res) => {
   cleanupExpiredPairings();
@@ -91,8 +102,8 @@ app.post("/api/laptops/register", (req, res) => {
 
   const now = Date.now();
   const laptopId = createId("lap");
-  const laptopToken = createToken("ltkn");
   const deviceId = createId("dev");
+  const laptopToken = issueLaptopToken(laptopId, deviceId);
   const wakeMacAddress = normalizeMacAddress(
     req.body?.wakeMac || req.body?.wake_mac || req.body?.macAddress || req.body?.wake?.macAddress
   );
@@ -151,6 +162,7 @@ app.get("/api/laptops/me", (req, res) => {
     ok: true,
     laptopId: laptop.laptopId,
     deviceId: laptop.deviceId,
+    laptopToken: preferredLaptopToken(laptop),
     name: laptop.name,
     pairedAt: laptop.pairedAt,
     connected: isLaptopConnected(laptop.laptopId),
@@ -204,6 +216,7 @@ app.post("/api/laptops/pairing", (req, res) => {
     ok: true,
     laptopId: laptop.laptopId,
     deviceId: laptop.deviceId,
+    laptopToken: preferredLaptopToken(laptop),
     pairCode: pairing.code,
     pairingExpiresAt: pairing.expiresAt,
     pairingUrl: pairing.pairingUrl,
@@ -261,7 +274,7 @@ app.post("/api/pairings/claim", (req, res) => {
     });
   }
 
-  const phoneToken = createToken("ptkn");
+  const phoneToken = issuePhoneToken(pairing.deviceId);
   const now = Date.now();
 
   mutateState(() => {
@@ -586,8 +599,9 @@ server.on("upgrade", (request, socket, head) => {
     return;
   }
 
-  const token = safeText(parsedUrl.searchParams.get("token"), 400);
-  const laptop = findLaptopByToken(token);
+  const token = safeText(parsedUrl.searchParams.get("token"), 4000);
+  const resolved = resolveLaptopAuth(token);
+  const laptop = resolved?.laptop || null;
   if (!laptop) {
     socket.write("HTTP/1.1 401 Unauthorized\r\n\r\n");
     socket.destroy();
@@ -595,11 +609,11 @@ server.on("upgrade", (request, socket, head) => {
   }
 
   wss.handleUpgrade(request, socket, head, (ws) => {
-    wss.emit("connection", ws, laptop);
+    wss.emit("connection", ws, laptop, resolved);
   });
 });
 
-wss.on("connection", (ws, laptop) => {
+wss.on("connection", (ws, laptop, authInfo) => {
   const existing = laptopSockets.get(laptop.laptopId);
   if (existing && existing !== ws && existing.readyState === WebSocket.OPEN) {
     existing.close(4000, "replaced by newer connection");
@@ -616,6 +630,7 @@ wss.on("connection", (ws, laptop) => {
     type: "welcome",
     laptopId: laptop.laptopId,
     deviceId: laptop.deviceId,
+    laptopToken: authInfo?.refreshedToken || null,
     relayTime: Date.now()
   });
 
@@ -1042,9 +1057,14 @@ function requirePhoneToken(req, res, next) {
     return res.status(401).json({ ok: false, error: "phone token missing" });
   }
 
-  const phone = findPhoneByToken(token);
+  const resolved = resolvePhoneSession(token);
+  const phone = resolved?.phone || null;
   if (!phone) {
     return res.status(401).json({ ok: false, error: "invalid phone token" });
+  }
+
+  if (resolved?.refreshedToken && resolved.refreshedToken !== token) {
+    res.setHeader(PHONE_TOKEN_HEADER, resolved.refreshedToken);
   }
 
   phone.lastUsedAt = Date.now();
@@ -1061,9 +1081,15 @@ function requireLaptopToken(req, res, next) {
     return res.status(401).json({ ok: false, error: "laptop token missing" });
   }
 
-  const laptop = findLaptopByToken(token);
+  const resolved = resolveLaptopAuth(token);
+  const laptop = resolved?.laptop || null;
   if (!laptop) {
     return res.status(401).json({ ok: false, error: "invalid laptop token" });
+  }
+
+  if (resolved?.refreshedToken && resolved.refreshedToken !== token) {
+    res.setHeader(LAPTOP_TOKEN_HEADER, resolved.refreshedToken);
+    req.refreshedLaptopToken = resolved.refreshedToken;
   }
 
   laptop.updatedAt = Date.now();
@@ -1448,6 +1474,113 @@ function findPhoneByToken(token) {
   return state.phones.find((item) => item.phoneToken === token) || null;
 }
 
+function resolvePhoneSession(token) {
+  const exact = findPhoneByToken(token);
+  if (exact) {
+    const refreshedToken = issuePhoneToken(exact.deviceId);
+    return {
+      phone: exact,
+      refreshedToken: refreshedToken.startsWith("ptkn1_") ? refreshedToken : null
+    };
+  }
+
+  const claims = parseSignedToken(token, "ptkn1");
+  if (!claims || safeText(claims.kind, 40) !== "phone") return null;
+
+  const deviceId = safeText(claims.deviceId, 200);
+  if (!deviceId) return null;
+
+  const restored = {
+    phoneToken: token,
+    deviceId,
+    createdAt: Date.now(),
+    lastUsedAt: Date.now()
+  };
+
+  mutateState(() => {
+    if (!state.phones.some((item) => item.phoneToken === token)) {
+      state.phones.push(restored);
+      trimStateCollections();
+    }
+  });
+
+  return {
+    phone: findPhoneByToken(token) || restored,
+    refreshedToken: null
+  };
+}
+
+function resolveLaptopAuth(token) {
+  const exact = findLaptopByToken(token);
+  if (exact) {
+    const refreshedToken = issueLaptopToken(exact.laptopId, exact.deviceId);
+    return {
+      laptop: exact,
+      refreshedToken: refreshedToken.startsWith("ltkn1_") ? refreshedToken : null
+    };
+  }
+
+  const restored = restoreLaptopFromSignedToken(token);
+  if (!restored) return null;
+
+  return {
+    laptop: restored,
+    refreshedToken: null
+  };
+}
+
+function resolveLaptopSession(token) {
+  const resolved = resolveLaptopAuth(token);
+  return resolved?.laptop || null;
+}
+
+function restoreLaptopFromSignedToken(token) {
+  const claims = parseSignedToken(token, "ltkn1");
+  if (!claims || safeText(claims.kind, 40) !== "laptop") return null;
+
+  const laptopId = safeText(claims.laptopId, 200);
+  const deviceId = safeText(claims.deviceId, 200);
+  if (!laptopId || !deviceId) return null;
+
+  const existing = findLaptopById(laptopId) || findLaptopByDeviceId(deviceId);
+  if (existing) {
+    return existing;
+  }
+
+  const restored = {
+    laptopId,
+    deviceId,
+    laptopToken: token,
+    name: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    pairedAt: null,
+    pairCode: null,
+    pairingExpiresAt: null,
+    pairingUrl: null,
+    pairingPayload: null,
+    lastConnectedAt: null,
+    lastDisconnectedAt: null,
+    lastSnapshotAt: null,
+    latestSnapshot: null,
+    wake: {
+      macAddress: null
+    },
+    lastWakeRequestedAt: null,
+    lastWakeResult: null
+  };
+
+  mutateState(() => {
+    const alreadyThere = findLaptopById(laptopId) || findLaptopByDeviceId(deviceId);
+    if (!alreadyThere) {
+      state.laptops.push(restored);
+      trimStateCollections();
+    }
+  });
+
+  return findLaptopById(laptopId) || restored;
+}
+
 function findPreviewByAccessToken(accessToken) {
   if (!accessToken) return null;
   return state.previews.find((item) => item.accessToken === accessToken) || null;
@@ -1584,6 +1717,75 @@ function createToken(prefix) {
   return `${prefix}_${randomBytes(20).toString("hex")}`;
 }
 
+function issuePhoneToken(deviceId) {
+  const normalizedDeviceId = safeText(deviceId, 200);
+  if (!normalizedDeviceId || !RELAY_TOKEN_SECRET) {
+    return createToken("ptkn");
+  }
+
+  return createSignedToken("ptkn1", {
+    kind: "phone",
+    deviceId: normalizedDeviceId
+  });
+}
+
+function issueLaptopToken(laptopId, deviceId) {
+  const normalizedLaptopId = safeText(laptopId, 200);
+  const normalizedDeviceId = safeText(deviceId, 200);
+  if (!normalizedLaptopId || !normalizedDeviceId || !RELAY_TOKEN_SECRET) {
+    return createToken("ltkn");
+  }
+
+  return createSignedToken("ltkn1", {
+    kind: "laptop",
+    laptopId: normalizedLaptopId,
+    deviceId: normalizedDeviceId
+  });
+}
+
+function preferredLaptopToken(laptop) {
+  const upgraded = issueLaptopToken(laptop?.laptopId, laptop?.deviceId);
+  return upgraded.startsWith("ltkn1_") ? upgraded : safeText(laptop?.laptopToken, 1000);
+}
+
+function createSignedToken(prefix, payload) {
+  const body = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = createHmac("sha256", RELAY_TOKEN_SECRET).update(`${prefix}.${body}`).digest("base64url");
+  return `${prefix}_${body}.${signature}`;
+}
+
+function parseSignedToken(token, expectedPrefix) {
+  if (!RELAY_TOKEN_SECRET) return null;
+
+  const raw = safeText(token, 4000);
+  if (!raw.startsWith(`${expectedPrefix}_`)) return null;
+
+  const composite = raw.slice(expectedPrefix.length + 1);
+  const separatorIndex = composite.lastIndexOf(".");
+  if (separatorIndex <= 0 || separatorIndex >= composite.length - 1) return null;
+
+  const body = composite.slice(0, separatorIndex);
+  const signature = composite.slice(separatorIndex + 1);
+
+  let actual;
+  try {
+    actual = Buffer.from(signature, "base64url");
+  } catch {
+    return null;
+  }
+
+  const expected = createHmac("sha256", RELAY_TOKEN_SECRET).update(`${expectedPrefix}.${body}`).digest();
+  if (actual.length !== expected.length) return null;
+  if (!timingSafeEqual(actual, expected)) return null;
+
+  try {
+    const parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8"));
+    return isObject(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
 function generatePairCode() {
   const alphabet = "23456789ABCDEFGHJKMNPQRSTVWXYZ";
   let out = "";
@@ -1599,6 +1801,20 @@ function normalizePairCode(value) {
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, "");
   return normalized || "";
+}
+
+function resolveRelayTokenSecret() {
+  const explicit = safeText(process.env.RELAY_TOKEN_SECRET || process.env.AGENT_RELAY_TOKEN_SECRET || "", 1000);
+  if (explicit) return explicit;
+
+  const renderServiceId = safeText(process.env.RENDER_SERVICE_ID || "", 500);
+  if (renderServiceId) return `render:${renderServiceId}`;
+
+  if (/^https?:\/\/(?:localhost|127\.0\.0\.1|0\.0\.0\.0)(?::\d+)?$/i.test(RELAY_PUBLIC_URL)) {
+    return "agent-companion-local-dev-secret";
+  }
+
+  return "";
 }
 
 function mutateState(mutator) {

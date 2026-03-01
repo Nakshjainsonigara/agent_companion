@@ -522,6 +522,13 @@ async function requestJson<T>(configInput: ClientConfig | undefined, options: Re
       signal: controller.signal
     });
 
+    if (remote) {
+      const refreshedPhoneToken = safeTrim(response.headers.get("x-agent-companion-phone-token"));
+      if (refreshedPhoneToken && refreshedPhoneToken !== config.phoneToken) {
+        persistRefreshedPhoneToken(config, refreshedPhoneToken);
+      }
+    }
+
     if (remote && response.status === 401) {
       throw new TokenExpiredError();
     }
@@ -551,6 +558,14 @@ function resolveClientConfig(config?: ClientConfig): ClientConfig {
 
   const requestedBridge = normalizeBaseUrl(config.bridgeBaseUrl, "");
   const resolvedBridge = normalizeBaseUrl(requestedBridge || bridgeBaseUrlFromEnv(), DEFAULT_BRIDGE_URL);
+  const storedPairing = loadPairingConfig();
+  const storedRemoteToken =
+    config.mode === "REMOTE" &&
+    storedPairing?.mode === "REMOTE" &&
+    safeTrim(storedPairing.deviceId) === safeTrim(config.deviceId) &&
+    normalizeBaseUrl(storedPairing.relayBaseUrl, "") === normalizeBaseUrl(config.relayBaseUrl, "")
+      ? safeTrim(storedPairing.phoneToken)
+      : "";
 
   return {
     ...DEFAULT_CLIENT_CONFIG,
@@ -558,9 +573,23 @@ function resolveClientConfig(config?: ClientConfig): ClientConfig {
     bridgeBaseUrl: adaptLocalBridgeForPhone(resolvedBridge),
     relayBaseUrl: normalizeBaseUrl(config.relayBaseUrl, DEFAULT_RELAY_URL),
     bridgeToken: safeTrim(config.bridgeToken),
-    phoneToken: safeTrim(config.phoneToken),
+    phoneToken: storedRemoteToken || safeTrim(config.phoneToken),
     deviceId: safeTrim(config.deviceId)
   };
+}
+
+function persistRefreshedPhoneToken(config: ClientConfig, phoneToken: string) {
+  if (!isRemote(config)) return;
+
+  const existing = loadPairingConfig();
+  savePairingConfig({
+    mode: "REMOTE",
+    relayBaseUrl: normalizeBaseUrl(config.relayBaseUrl, DEFAULT_RELAY_URL),
+    phoneToken,
+    deviceId: safeTrim(config.deviceId),
+    phoneLabel: existing?.phoneLabel ?? null,
+    pairedAt: existing?.pairedAt ?? Date.now()
+  });
 }
 
 function normalizeActionArgs(configOrInput: ClientConfig | ActionInput, maybeInput?: ActionInput) {

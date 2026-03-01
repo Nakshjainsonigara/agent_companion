@@ -58,12 +58,30 @@ async function main() {
 
   await ensureBridgeAvailable();
 
-  const registration = await getOrCreateLaptopRegistration();
+  let registration = await getOrCreateLaptopRegistration();
   printPairingInfo(registration);
 
   while (!shuttingDown) {
-    await connectWebSocketOnce(registration.laptopToken);
+    const cached = loadCompanionState();
+    const activeLaptopToken = safeText(cached?.laptopToken, 1000) || registration.laptopToken;
+    const connectionResult = await connectWebSocketOnce(activeLaptopToken);
     if (shuttingDown) break;
+
+    const latest = loadCompanionState();
+    if (latest?.relayBaseUrl === relayBaseUrl && latest?.laptopToken) {
+      registration = {
+        ...registration,
+        laptopId: latest.laptopId || registration.laptopId,
+        deviceId: latest.deviceId || registration.deviceId,
+        laptopToken: latest.laptopToken,
+        pairCode: latest.pairCode || registration.pairCode,
+        pairingExpiresAt: latest.pairingExpiresAt || registration.pairingExpiresAt,
+        pairingUrl: latest.pairingUrl || registration.pairingUrl
+      };
+    } else if (connectionResult?.authRejected) {
+      registration = await getOrCreateLaptopRegistration();
+      printPairingInfo(registration);
+    }
 
     const waitMs = reconnectDelayMs;
     await sleep(waitMs);
@@ -124,6 +142,7 @@ async function fetchExistingLaptopRegistration(laptopToken) {
     if (!me?.laptopId || !me?.deviceId) {
       return null;
     }
+    const preferredLaptopToken = safeText(me?.laptopToken, 1000) || laptopToken;
 
     const pairingResponse = await fetchWithTimeout(
       `${relayBaseUrl}/api/laptops/pairing`,
@@ -154,7 +173,7 @@ async function fetchExistingLaptopRegistration(laptopToken) {
     return {
       laptopId: me.laptopId,
       deviceId: me.deviceId,
-      laptopToken,
+      laptopToken: safeText(pairing?.laptopToken, 1000) || preferredLaptopToken,
       pairCode: pairing.pairCode,
       pairingExpiresAt: pairing.pairingExpiresAt,
       pairingUrl: pairing.pairingUrl,
@@ -229,6 +248,7 @@ function connectWebSocketOnce(laptopToken) {
   return new Promise((resolve) => {
     const socket = new WebSocket(wsUrl);
     websocket = socket;
+    let authRejected = false;
 
     socket.on("open", () => {
       reconnectDelayMs = 1200;
@@ -248,6 +268,19 @@ function connectWebSocketOnce(laptopToken) {
         return;
       }
       if (!isObject(message)) return;
+      if (message.type === "welcome" && typeof message.laptopToken === "string" && message.laptopToken.trim()) {
+        const cached = loadCompanionState();
+        persistCompanionState({
+          ...(cached || {}),
+          relayBaseUrl,
+          laptopId: safeText(message.laptopId, 200) || cached?.laptopId || "",
+          deviceId: safeText(message.deviceId, 200) || cached?.deviceId || "",
+          laptopToken: safeText(message.laptopToken, 1000),
+          pairCode: cached?.pairCode || null,
+          pairingExpiresAt: cached?.pairingExpiresAt || null,
+          pairingUrl: cached?.pairingUrl || null
+        });
+      }
       if (message.type === "rpc_request" && typeof message.id === "string") {
         void handleRpcRequest(socket, message);
       }
@@ -265,12 +298,16 @@ function connectWebSocketOnce(laptopToken) {
       } else if (!shuttingDown) {
         console.error("[companion] disconnected from relay, retrying...");
       }
-      resolve();
+      resolve({ authRejected });
     });
 
     socket.on("error", (error) => {
+      const message = String(error?.message || error || "");
+      if (message.includes("401") || message.includes("403")) {
+        authRejected = true;
+      }
       if (!quietLogs) {
-        console.error(`[companion] websocket error: ${String(error?.message || error)}`);
+        console.error(`[companion] websocket error: ${message}`);
       }
     });
   });
