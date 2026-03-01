@@ -257,9 +257,9 @@ function App() {
 
   const refreshLiveData = useCallback(
     async (options?: { force?: boolean }) => {
-      if (!pairingConfig) return false;
+      if (!pairingConfig) return "error";
       if (liveRefreshInFlightRef.current && !options?.force) {
-        return false;
+        return "skipped";
       }
 
       liveRefreshInFlightRef.current = true;
@@ -271,11 +271,11 @@ function App() {
       try {
         const snapshot = await fetchSessionsSnapshot(clientConfig);
         if (requestSeq !== liveRefreshSeqRef.current) {
-          return false;
+          return "skipped";
         }
         if (!snapshot) {
           setBridgeConnected(false);
-          return false;
+          return "error";
         }
 
         setBridgeConnected(true);
@@ -290,16 +290,22 @@ function App() {
         });
 
         if (Array.isArray(snapshot.runs) && !shouldForceLiveRuns) {
-          setLauncherRuns((previous) => (areRunsEquivalent(previous, snapshot.runs ?? []) ? previous : snapshot.runs ?? []));
+          setLauncherRuns((previous) => {
+            const merged = mergeLauncherRuns(previous, snapshot.runs ?? []);
+            return areRunsEquivalent(previous, merged) ? previous : merged;
+          });
         } else {
           try {
             const runs = liveRunsPromise ? await liveRunsPromise : await fetchSessionRuns(clientConfig);
-            if (requestSeq !== liveRefreshSeqRef.current) return false;
-            setLauncherRuns((previous) => (areRunsEquivalent(previous, runs) ? previous : runs));
+            if (requestSeq !== liveRefreshSeqRef.current) return "skipped";
+            setLauncherRuns((previous) => {
+              const merged = mergeLauncherRuns(previous, runs);
+              return areRunsEquivalent(previous, merged) ? previous : merged;
+            });
           } catch (runsError) {
             if (runsError instanceof TokenExpiredError) {
               handleTokenExpired();
-              return false;
+              return "error";
             }
           }
         }
@@ -313,12 +319,12 @@ function App() {
             setWorkspaceRootDraft((previous) => previous || snapshot.settings.workspaceRoot);
           }
         }
-        return true;
+        return "success";
       } catch (error) {
         if (error instanceof TokenExpiredError) {
           handleTokenExpired();
         }
-        return false;
+        return "error";
       } finally {
         if (requestSeq === liveRefreshSeqRef.current) {
           liveRefreshInFlightRef.current = false;
@@ -347,8 +353,8 @@ function App() {
 
     const loop = async () => {
       if (cancelled) return;
-      const ok = await refreshLiveData();
-      if (!cancelled && !ok) {
+      const result = await refreshLiveData();
+      if (!cancelled && result === "error") {
         setBridgeConnected(false);
       }
       if (cancelled) return;
@@ -505,8 +511,16 @@ function App() {
       const current = map.get(run.sessionId) ?? 0;
       map.set(run.sessionId, Math.max(current, getRunUpdatedAt(run)));
     }
+    for (const turn of chatTurns) {
+      const current = map.get(turn.sessionId) ?? 0;
+      map.set(turn.sessionId, Math.max(current, turn.createdAt));
+    }
+    for (const pending of pendingInputs) {
+      const current = map.get(pending.sessionId) ?? 0;
+      map.set(pending.sessionId, Math.max(current, pending.requestedAt));
+    }
     return map;
-  }, [visibleSessions, launcherRuns]);
+  }, [visibleSessions, launcherRuns, chatTurns, pendingInputs]);
 
   const eventsBySession = useMemo(() => {
     const map = new Map<string, SessionEvent[]>();
@@ -586,14 +600,8 @@ function App() {
             return previous;
           }
 
-          const next = [...previous];
-          if (currentIndex >= 0) {
-            next[currentIndex] = liveRun;
-          } else {
-            next.push(liveRun);
-          }
-          next.sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
-          return next;
+          const merged = mergeLauncherRuns(previous, [liveRun]);
+          return areRunsEquivalent(previous, merged) ? previous : merged;
         });
       } catch (error) {
         if (error instanceof TokenExpiredError) {
@@ -3856,6 +3864,55 @@ function areRunsEquivalent(previous: LauncherRun[], next: LauncherRun[]) {
   return true;
 }
 
+function mergeLauncherRuns(previous: LauncherRun[], incoming: LauncherRun[]) {
+  const merged = new Map<string, LauncherRun>();
+
+  for (const run of Array.isArray(previous) ? previous : []) {
+    if (!run?.id) continue;
+    merged.set(run.id, run);
+  }
+
+  for (const run of Array.isArray(incoming) ? incoming : []) {
+    if (!run?.id) continue;
+    const existing = merged.get(run.id);
+    if (!existing) {
+      merged.set(run.id, run);
+      continue;
+    }
+
+    const keepIncoming = compareRunFreshness(run, existing) >= 0;
+    merged.set(run.id, keepIncoming ? mergeSingleRun(existing, run) : mergeSingleRun(run, existing));
+  }
+
+  return [...merged.values()].sort((a, b) => getRunUpdatedAt(b) - getRunUpdatedAt(a));
+}
+
+function mergeSingleRun(base: LauncherRun, incoming: LauncherRun) {
+  const baseTail = Array.isArray(base.outputTail) ? base.outputTail : [];
+  const incomingTail = Array.isArray(incoming.outputTail) ? incoming.outputTail : [];
+  const outputTail = incomingTail.length >= baseTail.length ? incomingTail : baseTail;
+
+  return {
+    ...base,
+    ...incoming,
+    outputTail,
+    assistantFinalOutput: incoming.assistantFinalOutput || base.assistantFinalOutput,
+  };
+}
+
+function compareRunFreshness(a: LauncherRun, b: LauncherRun) {
+  const updatedDiff = getRunUpdatedAt(a) - getRunUpdatedAt(b);
+  if (updatedDiff !== 0) return updatedDiff;
+
+  const tailDiff = (Array.isArray(a.outputTail) ? a.outputTail.length : 0) - (Array.isArray(b.outputTail) ? b.outputTail.length : 0);
+  if (tailDiff !== 0) return tailDiff;
+
+  const finalOutputDiff = Number(Boolean(a.assistantFinalOutput)) - Number(Boolean(b.assistantFinalOutput));
+  if (finalOutputDiff !== 0) return finalOutputDiff;
+
+  return Number(a.startedAt ?? 0) - Number(b.startedAt ?? 0);
+}
+
 function areSettingsEquivalent(previous: SettingsPrefs, next: SettingsPrefs) {
   return (
     previous.criticalRealtime === next.criticalRealtime &&
@@ -3877,15 +3934,27 @@ function dedupeSessionList(sessions: AgentSession[], runs: LauncherRun[]) {
       .filter((id): id is string => Boolean(id))
   );
 
-  const threadToSession = new Map<string, { sessionId: string; updatedAt: number }>();
+  const codexThreadToSession = new Map<string, { sessionId: string; updatedAt: number }>();
+  const claudeThreadToSession = new Map<string, { sessionId: string; updatedAt: number }>();
   for (const run of runs) {
-    if (run.agentType !== "CODEX") continue;
-    const threadId = getCodexThreadId(run);
-    if (!threadId) continue;
     const updatedAt = getRunUpdatedAt(run);
-    const existing = threadToSession.get(threadId);
-    if (!existing || updatedAt >= existing.updatedAt) {
-      threadToSession.set(threadId, { sessionId: run.sessionId, updatedAt });
+    if (run.agentType === "CODEX") {
+      const threadId = getCodexThreadId(run);
+      if (!threadId) continue;
+      const existing = codexThreadToSession.get(threadId);
+      if (!existing || updatedAt >= existing.updatedAt) {
+        codexThreadToSession.set(threadId, { sessionId: run.sessionId, updatedAt });
+      }
+      continue;
+    }
+
+    if (run.agentType === "CLAUDE") {
+      const threadId = getClaudeSessionId(run);
+      if (!threadId) continue;
+      const existing = claudeThreadToSession.get(threadId);
+      if (!existing || updatedAt >= existing.updatedAt) {
+        claudeThreadToSession.set(threadId, { sessionId: run.sessionId, updatedAt });
+      }
     }
   }
 
@@ -3896,7 +3965,17 @@ function dedupeSessionList(sessions: AgentSession[], runs: LauncherRun[]) {
     if (session.id.startsWith("codex:")) {
       const threadId = session.id.slice("codex:".length).trim().toLowerCase();
       if (threadId) {
-        const mapped = threadToSession.get(threadId);
+        const mapped = codexThreadToSession.get(threadId);
+        if (mapped && mapped.sessionId !== session.id) {
+          return false;
+        }
+      }
+    }
+
+    if (session.id.startsWith("claude:")) {
+      const threadId = normalizeClaudeSessionId(session.id.slice("claude:".length));
+      if (threadId) {
+        const mapped = claudeThreadToSession.get(threadId);
         if (mapped && mapped.sessionId !== session.id) {
           return false;
         }

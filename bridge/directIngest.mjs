@@ -5,6 +5,8 @@ import path from "node:path";
 const MAX_FILES_PER_PROVIDER = 24;
 const MAX_SESSION_AGE_MS = 3 * 24 * 60 * 60 * 1000;
 const PENDING_FRESH_WINDOW_MS = 7_500;
+const MAX_CHAT_TURNS_PER_SESSION = 24;
+const MAX_CHAT_TURNS_TOTAL = 160;
 const PENDING_PATTERN =
   /input required|needs input|waiting for input|approval[_\s-]*required|awaiting approval|please approve|approve (?:this|the) plan|should i (?:proceed|implement|execute)|would you like me to (?:proceed|implement|execute)|ready to (?:implement|execute)|want me to (?:implement|execute)|proceed with implementation/i;
 
@@ -45,10 +47,21 @@ export function collectDirectSnapshot(nowMs = Date.now()) {
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, 30);
 
+  const chatTurnById = new Map();
+  for (const turn of [...codexSessions.chatTurns, ...claudeSessions.chatTurns]) {
+    if (!turn?.id || !turn?.sessionId) continue;
+    if (nowMs - safeNumber(turn.createdAt, 0) > MAX_SESSION_AGE_MS) continue;
+    chatTurnById.set(turn.id, turn);
+  }
+  const chatTurns = [...chatTurnById.values()]
+    .sort((a, b) => a.createdAt - b.createdAt)
+    .slice(-MAX_CHAT_TURNS_TOTAL);
+
   return {
     sessions,
     pendingInputs,
     events,
+    chatTurns,
     settings: {
       pairingHealthy: true,
       metadataOnly: true,
@@ -64,6 +77,7 @@ function collectCodexSessions(nowMs) {
   const sessions = [];
   const pendingInputs = [];
   const events = [];
+  const chatTurns = [];
 
   for (const file of files) {
     const summary = parseCodexFile(file, nowMs);
@@ -72,9 +86,12 @@ function collectCodexSessions(nowMs) {
     sessions.push(summary.session);
     if (summary.pendingInput) pendingInputs.push(summary.pendingInput);
     if (summary.event) events.push(summary.event);
+    if (Array.isArray(summary.chatTurns)) {
+      chatTurns.push(...summary.chatTurns);
+    }
   }
 
-  return { sessions, pendingInputs, events };
+  return { sessions, pendingInputs, events, chatTurns };
 }
 
 function collectClaudeSessions(nowMs) {
@@ -84,6 +101,7 @@ function collectClaudeSessions(nowMs) {
   const sessions = [];
   const pendingInputs = [];
   const events = [];
+  const chatTurns = [];
 
   for (const file of files) {
     const summary = parseClaudeFile(file, nowMs);
@@ -92,9 +110,12 @@ function collectClaudeSessions(nowMs) {
     sessions.push(summary.session);
     if (summary.pendingInput) pendingInputs.push(summary.pendingInput);
     if (summary.event) events.push(summary.event);
+    if (Array.isArray(summary.chatTurns)) {
+      chatTurns.push(...summary.chatTurns);
+    }
   }
 
-  return { sessions, pendingInputs, events };
+  return { sessions, pendingInputs, events, chatTurns };
 }
 
 function parseCodexFile(file, nowMs) {
@@ -117,6 +138,7 @@ function parseCodexFile(file, nowMs) {
   let pendingHintTs = 0;
   let sawFinalAnswer = false;
   let sawError = false;
+  const chatTurns = [];
   let usage = {
     promptTokens: 0,
     completionTokens: 0,
@@ -143,6 +165,12 @@ function parseCodexFile(file, nowMs) {
     if (record.type === "event_msg" && record.payload?.type === "user_message") {
       const message = String(record.payload?.message || "").trim();
       if (message && !isNoisePrompt(message) && !firstPrompt) firstPrompt = message;
+      appendDirectTurn(chatTurns, {
+        sessionId: "",
+        role: "USER",
+        text: message,
+        createdAt: ts || readFileMtimeMs(file, nowMs)
+      });
       if (PENDING_PATTERN.test(message)) {
         pendingHint = message;
         pendingHintTs = ts || pendingHintTs;
@@ -153,6 +181,12 @@ function parseCodexFile(file, nowMs) {
     if (record.type === "event_msg" && record.payload?.type === "agent_message") {
       const message = String(record.payload?.message || "").trim();
       if (message) latestAgentMessage = message;
+      appendDirectTurn(chatTurns, {
+        sessionId: "",
+        role: "ASSISTANT",
+        text: message,
+        createdAt: ts || readFileMtimeMs(file, nowMs)
+      });
       if (PENDING_PATTERN.test(message)) {
         pendingHint = message;
         pendingHintTs = ts || pendingHintTs;
@@ -186,6 +220,12 @@ function parseCodexFile(file, nowMs) {
       if (role === "user") {
         const text = extractCodexText(record.payload?.content);
         if (text && !isNoisePrompt(text) && !firstPrompt) firstPrompt = text;
+        appendDirectTurn(chatTurns, {
+          sessionId: "",
+          role: "USER",
+          text,
+          createdAt: ts || readFileMtimeMs(file, nowMs)
+        });
         if (text && PENDING_PATTERN.test(text)) {
           pendingHint = text;
           pendingHintTs = ts || pendingHintTs;
@@ -194,6 +234,12 @@ function parseCodexFile(file, nowMs) {
         const text = extractCodexText(record.payload?.content);
         if (text) {
           latestAgentMessage = text;
+          appendDirectTurn(chatTurns, {
+            sessionId: "",
+            role: "ASSISTANT",
+            text,
+            createdAt: ts || readFileMtimeMs(file, nowMs)
+          });
           if (PENDING_PATTERN.test(text)) {
             pendingHint = text;
             pendingHintTs = ts || pendingHintTs;
@@ -206,6 +252,7 @@ function parseCodexFile(file, nowMs) {
 
   const fallbackId = path.basename(file).replace(/\.jsonl$/i, "");
   const sessionId = `codex:${sourceSessionId || fallbackId}`;
+  const finalizedTurns = finalizeDirectTurns(chatTurns, sessionId);
   const effectiveLastUpdated = latestTs || readFileMtimeMs(file, nowMs);
   const ageSec = Math.max(0, Math.floor((nowMs - effectiveLastUpdated) / 1000));
   const pendingStillActive =
@@ -222,6 +269,10 @@ function parseCodexFile(file, nowMs) {
 
   const title = truncate(firstPrompt || latestAgentMessage || "Codex session", 88);
   const repo = cwd ? path.basename(cwd) : "unknown-repo";
+
+  if (!firstPrompt && !latestAgentMessage && finalizedTurns.length === 0) {
+    return null;
+  }
 
   const progress =
     state === "COMPLETED"
@@ -279,7 +330,7 @@ function parseCodexFile(file, nowMs) {
     category: state === "FAILED" ? "ERROR" : state === "WAITING_INPUT" ? "INPUT" : "INFO"
   };
 
-  return { session, pendingInput, event };
+  return { session, pendingInput, event, chatTurns: finalizedTurns };
 }
 
 function parseClaudeFile(file, nowMs) {
@@ -302,6 +353,7 @@ function parseClaudeFile(file, nowMs) {
   let pendingHint = "";
   let pendingHintTs = 0;
   let sawError = false;
+  const chatTurns = [];
   let usage = {
     promptTokens: 0,
     completionTokens: 0,
@@ -316,6 +368,9 @@ function parseClaudeFile(file, nowMs) {
       continue;
     }
 
+    if (record?.isSidechain) continue;
+    if (String(record?.type || "").trim().toLowerCase() === "queue-operation") continue;
+
     const ts = safeDateMs(record.timestamp);
     if (ts > latestTs) latestTs = ts;
 
@@ -326,6 +381,12 @@ function parseClaudeFile(file, nowMs) {
     if (record.type === "user") {
       const userText = extractClaudeUserText(record.message);
       if (userText && !firstPrompt) firstPrompt = userText;
+      appendDirectTurn(chatTurns, {
+        sessionId: "",
+        role: "USER",
+        text: userText,
+        createdAt: ts || readFileMtimeMs(file, nowMs)
+      });
       if (PENDING_PATTERN.test(userText)) {
         pendingHint = userText;
         pendingHintTs = ts || pendingHintTs;
@@ -336,6 +397,12 @@ function parseClaudeFile(file, nowMs) {
     if (record.type === "assistant") {
       const assistantText = extractClaudeAssistantText(record.message);
       if (assistantText) latestAssistantText = assistantText;
+      appendDirectTurn(chatTurns, {
+        sessionId: "",
+        role: "ASSISTANT",
+        text: assistantText,
+        createdAt: ts || readFileMtimeMs(file, nowMs)
+      });
       if (PENDING_PATTERN.test(assistantText)) {
         pendingHint = assistantText;
         pendingHintTs = ts || pendingHintTs;
@@ -356,6 +423,7 @@ function parseClaudeFile(file, nowMs) {
 
   const fallbackId = path.basename(file).replace(/\.jsonl$/i, "");
   const sessionId = `claude:${sourceSessionId || fallbackId}`;
+  const finalizedTurns = finalizeDirectTurns(chatTurns, sessionId);
   const effectiveLastUpdated = latestTs || readFileMtimeMs(file, nowMs);
   const ageSec = Math.max(0, Math.floor((nowMs - effectiveLastUpdated) / 1000));
   const pendingStillActive =
@@ -369,6 +437,10 @@ function parseClaudeFile(file, nowMs) {
     sawError,
     hasPendingHint: pendingStillActive
   });
+
+  if (!firstPrompt && !latestAssistantText && finalizedTurns.length === 0) {
+    return null;
+  }
 
   const title = truncate(firstPrompt || latestAssistantText || "Claude Code session", 88);
   const repo = cwd ? path.basename(cwd) : "unknown-repo";
@@ -429,7 +501,7 @@ function parseClaudeFile(file, nowMs) {
     category: state === "FAILED" ? "ERROR" : state === "WAITING_INPUT" ? "INPUT" : "INFO"
   };
 
-  return { session, pendingInput, event };
+  return { session, pendingInput, event, chatTurns: finalizedTurns };
 }
 
 function deriveState({ ageSec, sawFinalAnswer, sawError, hasPendingHint }) {
@@ -444,7 +516,8 @@ function extractCodexText(content) {
   if (!Array.isArray(content)) return "";
   for (const item of content) {
     if (typeof item?.text === "string" && item.text.trim()) {
-      return item.text.trim();
+      const text = sanitizeDirectText(item.text);
+      if (!isNoisePrompt(text)) return text;
     }
   }
   return "";
@@ -452,13 +525,25 @@ function extractCodexText(content) {
 
 function extractClaudeUserText(message) {
   if (!message) return "";
-  if (typeof message.content === "string") return message.content.trim();
+  if (typeof message.content === "string") {
+    const text = sanitizeDirectText(message.content);
+    return isNoisePrompt(text) ? "" : text;
+  }
   if (!Array.isArray(message.content)) return "";
 
   for (const part of message.content) {
-    if (typeof part === "string" && part.trim()) return part.trim();
-    if (typeof part?.text === "string" && part.text.trim()) return part.text.trim();
-    if (typeof part?.content === "string" && part.content.trim()) return part.content.trim();
+    if (typeof part === "string") {
+      const text = sanitizeDirectText(part);
+      if (text && !isNoisePrompt(text)) return text;
+    }
+    if (typeof part?.text === "string") {
+      const text = sanitizeDirectText(part.text);
+      if (text && !isNoisePrompt(text)) return text;
+    }
+    if (typeof part?.content === "string" && part.content.trim()) {
+      const text = sanitizeDirectText(part.content);
+      if (text && !isNoisePrompt(text)) return text;
+    }
   }
 
   return "";
@@ -466,15 +551,29 @@ function extractClaudeUserText(message) {
 
 function extractClaudeAssistantText(message) {
   if (!message) return "";
+  if (typeof message.content === "string") {
+    const text = sanitizeDirectText(message.content);
+    return isNoisePrompt(text) ? "" : text;
+  }
   if (!Array.isArray(message.content)) return "";
 
+  const collected = [];
+
   for (const part of message.content) {
-    if (typeof part?.text === "string" && part.text.trim()) {
-      return part.text.trim();
+    if (part?.type === "text" && typeof part?.text === "string" && part.text.trim()) {
+      const text = sanitizeDirectText(part.text);
+      if (!isNoisePrompt(text)) {
+        collected.push(text);
+      }
+    } else if (!part?.type && typeof part?.text === "string" && part.text.trim()) {
+      const text = sanitizeDirectText(part.text);
+      if (!isNoisePrompt(text)) {
+        collected.push(text);
+      }
     }
   }
 
-  return "";
+  return collected.join("\n\n").trim();
 }
 
 function safeDateMs(value) {
@@ -509,7 +608,67 @@ function isNoisePrompt(text) {
   if (raw.includes("Filesystem sandboxing defines")) return true;
   if (raw.includes("AGENT_COMPANION_PERSIST_SERVER_HINT_V1")) return true;
   if (raw.includes("[Request interrupted by user for tool use]")) return true;
+  if (raw === "Answer questions?") return true;
   return false;
+}
+
+function appendDirectTurn(turns, input) {
+  const text = sanitizeDirectText(input?.text);
+  if (!text || isNoisePrompt(text)) return;
+
+  const role = input?.role === "ASSISTANT" ? "ASSISTANT" : "USER";
+  const createdAt = safeNumber(input?.createdAt, Date.now());
+  const normalized = normalizeComparableText(text);
+  const last = turns[turns.length - 1];
+  if (
+    last &&
+    last.role === role &&
+    normalizeComparableText(last.text) === normalized &&
+    Math.abs(safeNumber(last.createdAt, 0) - createdAt) <= 3_000
+  ) {
+    return;
+  }
+
+  turns.push({
+    sessionId: input?.sessionId || "",
+    role,
+    kind: "MESSAGE",
+    text,
+    createdAt,
+    source: "DIRECT"
+  });
+}
+
+function finalizeDirectTurns(turns, sessionId) {
+  if (!Array.isArray(turns) || !sessionId) return [];
+
+  return turns
+    .slice(-MAX_CHAT_TURNS_PER_SESSION)
+    .map((turn, index) => ({
+      ...turn,
+      id: `direct:${sessionId}:${safeNumber(turn.createdAt, 0)}:${turn.role}:${index}`,
+      sessionId
+    }))
+    .sort((a, b) => a.createdAt - b.createdAt);
+}
+
+function normalizeComparableText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function sanitizeDirectText(value) {
+  const text = String(value || "")
+    .replace(/\r/g, "")
+    .trim();
+  if (!text) return "";
+
+  return text
+    .replace(/\n*AGENT_COMPANION_PERSIST_SERVER_HINT_V1:[\s\S]*$/i, "")
+    .replace(/\n*\[Request interrupted by user for tool use\]\s*$/i, "")
+    .trim();
 }
 
 function getRecentJsonlFiles(rootDir, limit) {
@@ -532,6 +691,7 @@ function getRecentJsonlFiles(rootDir, limit) {
     for (const entry of entries) {
       const fullPath = path.join(current, entry.name);
       if (entry.isDirectory()) {
+        if (entry.name === "subagents") continue;
         stack.push(fullPath);
         continue;
       }

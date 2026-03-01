@@ -23,6 +23,7 @@ const MAX_TRANSCRIPT_SEGMENTS_PER_RUN = 220;
 const RUN_OUTPUT_TOUCH_INTERVAL_MS = 1200;
 const DIRECT_PENDING_STALE_MS = 90_000;
 const DIRECT_EVENT_STALE_MS = 2 * 60 * 60 * 1000;
+const DIRECT_SNAPSHOT_POLL_INTERVAL_MS = 2_500;
 const MAX_MANAGED_SERVICES = 120;
 const MAX_MANAGED_SERVICE_OUTPUT_LINES = 180;
 
@@ -1923,6 +1924,31 @@ function mergeDirectSnapshot(snapshot) {
     }
   }
 
+  const incomingDirectTurnIds = new Set(
+    (Array.isArray(snapshot.chatTurns) ? snapshot.chatTurns : [])
+      .map((item) => item?.id)
+      .filter((id) => typeof id === "string")
+  );
+  state.chatTurns = (Array.isArray(state.chatTurns) ? state.chatTurns : []).filter((item) => {
+    const sessionId = String(item?.sessionId || "");
+    const isDirectSession = sessionId.startsWith("codex:") || sessionId.startsWith("claude:");
+    const isDirectTurn = safeTrimmedText(item?.source, 48).toUpperCase() === "DIRECT" || String(item?.id || "").startsWith("direct:");
+    if (!isDirectSession || !isDirectTurn) return true;
+    if (!incomingDirectSessionIds.has(sessionId)) return false;
+    return incomingDirectTurnIds.has(item.id);
+  });
+
+  const existingTurns = new Map((Array.isArray(state.chatTurns) ? state.chatTurns : []).map((item) => [item.id, item]));
+  for (const incoming of Array.isArray(snapshot.chatTurns) ? snapshot.chatTurns : []) {
+    if (!incoming?.id || !incoming?.sessionId) continue;
+    const previous = existingTurns.get(incoming.id);
+    if (previous) {
+      Object.assign(previous, incoming);
+    } else {
+      state.chatTurns.push(incoming);
+    }
+  }
+
   if (snapshot.settings && typeof snapshot.settings === "object") {
     state.settings = {
       ...state.settings,
@@ -2187,8 +2213,10 @@ function applyPendingAction(input) {
       });
     }
 
-    const turnText =
-      type === "APPROVE"
+    const isTextualReply = isQuestionRequest || type === "TEXT_REPLY";
+    const turnText = isQuestionRequest
+      ? questionReplyText
+      : type === "APPROVE"
         ? "Approved"
         : type === "REJECT"
           ? "Rejected"
@@ -2196,7 +2224,7 @@ function applyPendingAction(input) {
     appendChatTurn({
       sessionId,
       role: "USER",
-      kind: "APPROVAL_ACTION",
+      kind: isTextualReply ? "MESSAGE" : "APPROVAL_ACTION",
       text: turnText,
       createdAt: now,
       runId: launchedFollowUpRun?.id || targetRun?.id || null,
@@ -2679,5 +2707,5 @@ app.listen(PORT, () => {
       const snapshot = collectDirectSnapshot();
       mergeDirectSnapshot(snapshot);
     });
-  }, 8000);
+  }, DIRECT_SNAPSHOT_POLL_INTERVAL_MS);
 });
